@@ -19,6 +19,8 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pkg/sftp"
@@ -152,12 +154,20 @@ func newLocalStorage(t *testing.T) *Storage {
 	root := t.TempDir()
 	host, port := startSFTPServer(t, root)
 
+	// SFTP speaks POSIX paths: the server only treats a path as absolute when it
+	// starts with "/". Encode the native temp dir accordingly so the prefix
+	// survives on Windows ("C:\Users\..." -> "/C:/Users/...").
+	prefix := filepath.ToSlash(root)
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+
 	st, err := NewStorage(Config{
 		Host:     host,
 		Port:     port,
 		User:     testServerUser,
 		Password: testServerPassword,
-		Prefix:   root,
+		Prefix:   prefix,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })

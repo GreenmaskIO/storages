@@ -57,19 +57,32 @@ is navigable through the same interface. Also provided: `storages.ErrFileNotFoun
 (returned by `GetObject` when the object is absent) and `storages.Walk(ctx, st,
 parent)` (recursively lists every file under a storage).
 
-Once constructed, every backend behaves the same:
+Once constructed, every backend behaves the same, so write your code against
+`Storager` and let the caller decide where the bytes land:
 
 ```go
-var st storages.Storager = /* any backend below */
+func report(ctx context.Context, st storages.Storager) ([]string, error) {
+	if err := st.Ping(ctx); err != nil { // health check
+		return nil, err
+	}
+	if err := st.PutObject(ctx, "reports/2023.txt", strings.NewReader("annual report")); err != nil {
+		return nil, err
+	}
+	return storages.Walk(ctx, st, "") // -> ["reports/2023.txt"]
+}
+```
 
-if err := st.Ping(ctx); err != nil {           // health check
+The caller picks the backend — any of the constructors below, all of which
+return a `Storager`:
+
+```go
+st, err := directory.NewStorage(directory.Config{Path: "/var/dumps"})
+if err != nil {
 	return err
 }
-if err := st.PutObject(ctx, "reports/2023.txt", strings.NewReader("annual report")); err != nil {
-	return err
-}
-files, err := storages.Walk(ctx, st, "")       // -> ["reports/2023.txt"]
-_ = st.Close()                                  // always call it when done
+defer st.Close() // always close when done
+
+files, err := report(ctx, st)
 ```
 
 ## Backends

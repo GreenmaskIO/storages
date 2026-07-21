@@ -29,19 +29,13 @@ jobs:
       - name: Test (fs backends + shared code)
         run: go test ./ ./directory/... ./inmemory/... ./internal/...
 
-  # Race detector on Linux only (no CGO toolchain assumptions on other runners).
-  race:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Test with race detector
-        run: go test -race ./ ./directory/... ./inmemory/... ./internal/...
-
   # The s3/azure/ssh unit tests spin up containers via testcontainers, so they
-  # run separately on Ubuntu where Docker is available.
+  # run on Ubuntu where Docker is available. This job also carries the race
+  # detector for the whole module: Linux is the only runner we make CGO
+  # toolchain assumptions on, and the packages gated behind Docker include the
+  # ones with shared mutable state (ssh's lazily-established, clone-shared
+  # connection), so restricting -race to the Docker-free packages would skip
+  # exactly the code most worth checking.
   test-docker:
     runs-on: ubuntu-latest
     steps:
@@ -49,8 +43,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test (backends needing Docker)
-        run: go test ./s3/... ./azure/... ./ssh/...
+      - name: Test with race detector (all backends)
+        run: go test -race ./...
 
   lint:
     runs-on: ubuntu-latest

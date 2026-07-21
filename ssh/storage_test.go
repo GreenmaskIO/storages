@@ -22,11 +22,14 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -178,6 +181,11 @@ const (
 	sftpImage    = "atmoz/sftp:alpine"
 	sftpUser     = "testuser"
 	sftpPassword = "testpass"
+
+	// sftpReadyTimeout bounds both the container wait strategy and the SSH
+	// handshake probe. Host-key generation dominates the startup time and is
+	// slow on shared CI runners, so keep this generous.
+	sftpReadyTimeout = 2 * time.Minute
 )
 
 var (
@@ -201,6 +209,13 @@ func TestMain(m *testing.M) {
 // sftpEndpoint lazily starts the shared atmoz/sftp container and returns its
 // host and mapped port. The command provisions user testuser/testpass with a
 // writable /upload directory.
+//
+// The image generates its SSH host keys on first boot, which takes seconds on a
+// loaded CI runner. Docker's userland proxy binds the mapped host port as soon
+// as the container starts and resets connections until sshd is actually
+// listening, so "the port accepts a TCP connection" is not a usable readiness
+// signal here — it is satisfied long before the handshake can succeed. We wait
+// for sshd's own startup log line and then confirm with a real SSH handshake.
 func sftpEndpoint(t *testing.T) (string, int) {
 	t.Helper()
 	sftpOnce.Do(func() {
@@ -209,7 +224,10 @@ func sftpEndpoint(t *testing.T) (string, int) {
 			Image:        sftpImage,
 			ExposedPorts: []string{"22/tcp"},
 			Cmd:          []string{fmt.Sprintf("%s:%s:::upload", sftpUser, sftpPassword)},
-			WaitingFor:   wait.ForListeningPort("22/tcp"),
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort("22/tcp"),
+				wait.ForLog("Server listening on 0.0.0.0 port 22"),
+			).WithDeadline(sftpReadyTimeout),
 		}
 		sftpCtr, sftpErr = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 			ContainerRequest: req,
@@ -228,9 +246,41 @@ func sftpEndpoint(t *testing.T) (string, int) {
 			return
 		}
 		sftpPort = int(mapped.Num())
+		sftpErr = waitForSSHHandshake(ctx, sftpHost, sftpPort)
 	})
 	require.NoError(t, sftpErr)
 	return sftpHost, sftpPort
+}
+
+// waitForSSHHandshake polls the mapped port with full SSH handshakes until one
+// succeeds. This is the readiness check that actually matters: it only passes
+// once sshd has its host keys and is serving on the mapped port.
+func waitForSSHHandshake(ctx context.Context, host string, port int) error {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	cfg := &ssh.ClientConfig{
+		User:            sftpUser,
+		Auth:            []ssh.AuthMethod{ssh.Password(sftpPassword)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, sftpReadyTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		client, err := ssh.Dial("tcp", addr, cfg)
+		if err == nil {
+			return client.Close()
+		}
+		lastErr = err
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("SFTP container never accepted an SSH connection on %s: %w", addr, lastErr)
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 // newTestStorage returns a Storage pointed at a unique prefix under /upload in

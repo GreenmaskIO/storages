@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"path"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -48,7 +49,10 @@ func backends() map[string]newStorage {
 		"osfs": func(t *testing.T) (*Storage, string) {
 			t.Helper()
 			cwd := t.TempDir()
-			return New(afero.NewOsFs(), cwd), cwd
+			// The backend keeps cwd in its forward-slash convention, so the
+			// expected cwd returned to the tests is normalized the same way —
+			// otherwise every path assertion would be Windows-only noise.
+			return New(afero.NewOsFs(), cwd), filepath.ToSlash(cwd)
 		},
 	}
 }

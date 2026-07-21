@@ -320,7 +320,9 @@ func TestStorage_SubStorage(t *testing.T) {
 			subImpl, ok := sub.(*Storage)
 			require.True(t, ok)
 			assert.Same(t, st.service, subImpl.service, "sub-storage must share the parent client")
-			assert.Same(t, st.config, subImpl.config, "sub-storage must share the parent config")
+			// Config is a value on Storage, so the sub-storage carries a copy —
+			// compare by equality, not identity.
+			assert.Equal(t, st.config, subImpl.config, "sub-storage must inherit the parent config")
 		})
 	}
 }

@@ -70,11 +70,22 @@ func WithLogger(logger *slog.Logger) Option {
 // paths straight to the os package and MemMapFs normalizes with
 // filepath.Separator — so without this the same key would resolve differently on
 // Windows. Normalizing to "/" keeps OsFs and MemMapFs identical and matches the
-// S3-style keys used by the other backends. os/afero.OsFs accept forward slashes
-// on Windows, and MemMapFs re-normalizes symmetrically, so round-trips stay
-// consistent.
+// S3-style keys used by the other backends: cwd, ObjectStat.Name and every path
+// this package joins are forward-slash regardless of platform. native() converts
+// back at the point the path is handed to afero.
 func toSlash(p string) string {
 	return filepath.ToSlash(p)
+}
+
+// native converts an internal forward-slash path back to the OS-native form
+// right at the afero boundary. afero is not consistent about normalizing what it
+// is handed: MemMapFs.Create stores keys under filepath.Clean (backslashes on
+// Windows) while MemMapFs.Chmod looks the key up verbatim, so a forward-slash
+// path silently misses the map and reports "file does not exist". Handing afero
+// native separators sidesteps that asymmetry, and OsFs prefers them anyway. On
+// Unix this is the identity function.
+func native(p string) string {
+	return filepath.FromSlash(p)
 }
 
 // New builds a Storage rooted at cwd on top of fsys.
@@ -100,7 +111,7 @@ func (s *Storage) Dirname() string {
 }
 
 func (s *Storage) ListDir(_ context.Context) (files []string, dirs []storages.Storager, err error) {
-	entries, err := afero.ReadDir(s.fs, s.cwd)
+	entries, err := afero.ReadDir(s.fs, native(s.cwd))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -115,7 +126,7 @@ func (s *Storage) ListDir(_ context.Context) (files []string, dirs []storages.St
 }
 
 func (s *Storage) GetObject(_ context.Context, filePath string) (io.ReadCloser, error) {
-	f, err := s.fs.Open(path.Join(s.cwd, toSlash(filePath)))
+	f, err := s.fs.Open(native(path.Join(s.cwd, toSlash(filePath))))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, storages.ErrFileNotFound
@@ -128,12 +139,12 @@ func (s *Storage) GetObject(_ context.Context, filePath string) (io.ReadCloser, 
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
 	fullPath := path.Join(s.cwd, toSlash(filePath))
 	if dir := path.Dir(fullPath); dir != "" {
-		if err := s.fs.MkdirAll(dir, s.dirMode); err != nil {
+		if err := s.fs.MkdirAll(native(dir), s.dirMode); err != nil {
 			return fmt.Errorf("error creating directory: %w", err)
 		}
 	}
 
-	f, err := s.fs.Create(fullPath)
+	f, err := s.fs.Create(native(fullPath))
 	if err != nil {
 		return fmt.Errorf("unable to create file: %w", err)
 	}
@@ -167,7 +178,7 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 	// Apply the configured file mode explicitly: afero.Fs.Create uses a fixed
 	// default, so without this s.fileMode would be dead configuration. On Windows
 	// Chmod only honors the write bit, which is acceptable.
-	if err := s.fs.Chmod(fullPath, s.fileMode); err != nil {
+	if err := s.fs.Chmod(native(fullPath), s.fileMode); err != nil {
 		return fmt.Errorf("error setting file mode: %w", err)
 	}
 	return nil
@@ -176,7 +187,7 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 func (s *Storage) Delete(_ context.Context, filePaths ...string) error {
 	for _, fp := range filePaths {
 		fullPath := path.Join(s.cwd, toSlash(fp))
-		info, err := s.fs.Stat(fullPath)
+		info, err := s.fs.Stat(native(fullPath))
 		if err != nil {
 			// Deleting a missing object is not an error.
 			if errors.Is(err, fs.ErrNotExist) {
@@ -185,9 +196,9 @@ func (s *Storage) Delete(_ context.Context, filePaths ...string) error {
 			return err
 		}
 		if info.IsDir() {
-			err = s.fs.RemoveAll(fullPath)
+			err = s.fs.RemoveAll(native(fullPath))
 		} else {
-			err = s.fs.Remove(fullPath)
+			err = s.fs.Remove(native(fullPath))
 		}
 		if err != nil {
 			return fmt.Errorf("error deleting %s: %w", fp, err)
@@ -197,14 +208,14 @@ func (s *Storage) Delete(_ context.Context, filePaths ...string) error {
 }
 
 func (s *Storage) DeleteAll(_ context.Context, pathPrefix string) error {
-	if err := s.fs.RemoveAll(path.Join(s.cwd, toSlash(pathPrefix))); err != nil {
+	if err := s.fs.RemoveAll(native(path.Join(s.cwd, toSlash(pathPrefix)))); err != nil {
 		return fmt.Errorf("error deleting %s: %w", pathPrefix, err)
 	}
 	return nil
 }
 
 func (s *Storage) Exists(_ context.Context, fileName string) (bool, error) {
-	_, err := s.fs.Stat(path.Join(s.cwd, toSlash(fileName)))
+	_, err := s.fs.Stat(native(path.Join(s.cwd, toSlash(fileName))))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
@@ -234,7 +245,7 @@ func (s *Storage) sub(cwd string) *Storage {
 
 func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 	fullPath := path.Join(s.cwd, toSlash(fileName))
-	info, err := s.fs.Stat(fullPath)
+	info, err := s.fs.Stat(native(fullPath))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return &storages.ObjectStat{Name: fullPath, Exist: false}, nil
@@ -250,7 +261,7 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 
 // Ping checks that the backend's current directory is readable.
 func (s *Storage) Ping(_ context.Context) error {
-	if _, err := afero.ReadDir(s.fs, s.cwd); err != nil {
+	if _, err := afero.ReadDir(s.fs, native(s.cwd)); err != nil {
 		return fmt.Errorf("error pinging storage: %w", err)
 	}
 	return nil

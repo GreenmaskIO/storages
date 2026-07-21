@@ -25,6 +25,8 @@ import (
 	"time"
 )
 
+// ObjectStat is the metadata returned by Storager.Stat. A missing object is
+// reported via Exist being false, not via an error.
 type ObjectStat struct {
 	Name         string
 	LastModified time.Time
@@ -37,7 +39,10 @@ type ObjectStat struct {
 // navigation via SubStorage and ListDir.
 //
 // Paths passed to the object methods are interpreted relative to the backend's
-// current working directory. ListDir returns []Storager and SubStorage returns
+// current working directory and use forward slashes on every OS. A missing
+// object surfaces differently per method: GetObject, Delete and DeleteAll
+// return an error wrapping ErrFileNotFound, while Exists and Stat report it as
+// a value with a nil error. ListDir returns []Storager and SubStorage returns
 // Storager, which makes the interface self-referential — this is why the
 // interface lives in a foundation package that no backend may import back into.
 type Storager interface {
@@ -53,8 +58,8 @@ type Storager interface {
 	// ErrFileNotFound if the object does not exist. The caller must Close the
 	// returned reader.
 	GetObject(ctx context.Context, filePath string) (reader io.ReadCloser, err error)
-	// PutObject writes body to the object at filePath, creating any intermediate
-	// directories as needed.
+	// PutObject writes body to the object at filePath, overwriting an existing
+	// object and creating any intermediate directories as needed.
 	PutObject(ctx context.Context, filePath string, body io.Reader) error
 	// Delete removes the named objects. It is object-level and never recursive:
 	// a path naming a directory rather than an object is not deleted. Use
@@ -73,7 +78,9 @@ type Storager interface {
 	// ErrFileNotFound, so DeleteAll is likewise not idempotent: re-running a
 	// deletion that already succeeded fails.
 	DeleteAll(ctx context.Context, pathPrefix string) error
-	// Exists reports whether fileName exists in the current directory.
+	// Exists reports whether fileName exists in the current directory. A missing
+	// object is (false, nil), not an error; an error means the lookup itself
+	// failed.
 	Exists(ctx context.Context, fileName string) (bool, error)
 	// SubStorage returns a Storager rooted at subPath. When relative is true the
 	// path is joined onto the current working directory; otherwise it is used as

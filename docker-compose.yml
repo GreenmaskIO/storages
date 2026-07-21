@@ -1,4 +1,4 @@
-# Local Linux test runner for the filesystem-like backends (directory, inmemory).
+# Local Linux test runner for the main module.
 #
 # It lets you reproduce the Linux CI job from any host — notably macOS, where the
 # default filesystem is case-insensitive and Unix permission modes are not fully
@@ -21,7 +21,7 @@ services:
     # Default command; override it via `docker compose run --rm test <cmd>`.
     # -count=1 disables Go's test-result cache so the tests always run for real
     # (compile cache is kept, so builds stay fast).
-    command: go test -count=1 ./ ./directory/... ./inmemory/... ./internal/...
+    command: go test -count=1 ./...
 
 volumes:
   gomod:

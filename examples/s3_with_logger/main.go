@@ -20,14 +20,14 @@
 // The scenario exercises the whole Storager lifecycle so every request/retry is
 // visible in the log:
 //
-//	1. create the storage and Ping the bucket
-//	2. PutObject a file at the root
-//	3. PutObject two files sharing a sub-folder via SubStorage
-//	4. Stat every object (they exist)
-//	5. Delete the single root file
-//	6. DeleteAll the sub-folder (file plus its "directory")
-//	7. Stat again (everything is gone)
-//	8. Close the storage
+//  1. create the storage and Ping the bucket
+//  2. PutObject a file at the root
+//  3. PutObject two files sharing a sub-folder via SubStorage
+//  4. Stat every object (they exist)
+//  5. Delete the single root file
+//  6. DeleteAll the sub-folder (file plus its "directory")
+//  7. Stat again (everything is gone)
+//  8. Close the storage
 //
 // The repository ships a docker-compose.yml with MinIO wired to the defaults
 // below, so the quickest way to run it is:

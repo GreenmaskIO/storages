@@ -26,8 +26,10 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// errStorageClosed is returned by Client() once the storage has been closed.
-var errStorageClosed = errors.New("ssh storage is closed")
+// ErrStorageClosed is returned by any operation on a storage whose Close has
+// already been called. Callers can test for it with errors.Is to tell a
+// closed-storage misuse apart from a transport failure.
+var ErrStorageClosed = errors.New("ssh storage is closed")
 
 // SFTPClient is the subset of *sftp.Client used by the storage. It is kept as
 // an interface so the dependency surface stays small and explicit.
@@ -73,7 +75,7 @@ func (l *sftpLazy) Client(ctx context.Context) (SFTPClient, error) {
 	defer l.mu.Unlock()
 
 	if l.closed {
-		return nil, errStorageClosed
+		return nil, ErrStorageClosed
 	}
 	// Connect only on the first call; reuse the connection afterwards. The
 	// outcome (success or failure) is cached for the lifetime of this storage.

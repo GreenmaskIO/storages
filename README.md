@@ -51,11 +51,40 @@ type Storager interface {
 }
 ```
 
+Three contract details worth knowing up front, because they are uniform across
+every backend:
+
+- **`Delete` is object-level and never recursive.** `DeleteAll` is the recursive
+  one. A path naming a directory is not an object, so `Delete` reports it as
+  missing rather than removing the sub-tree.
+- **Deleting something that is not there is an error, not a no-op.** Both
+  `Delete` and `DeleteAll` verify their targets first, so a call naming one bad
+  path deletes *nothing*. The error is a `*storages.MissingObjectsError` listing
+  the offending paths, wrapping `storages.ErrFileNotFound`:
+
+  ```go
+  err := st.Delete(ctx, "a.txt", "b.txt", "c.txt")
+
+  errors.Is(err, storages.ErrFileNotFound) // true if any were missing
+
+  var missing *storages.MissingObjectsError
+  if errors.As(err, &missing) {
+      log.Printf("not found: %v", missing.Paths) // ["b.txt"]; a.txt and c.txt still there
+  }
+  ```
+
+  The trade-off is that deletion is **not idempotent**: re-running a deletion
+  that already succeeded fails the second time. Code that retries or replays
+  deletions should check `errors.Is(err, storages.ErrFileNotFound)` and treat it
+  as success.
+- **`Stat` reports a missing object as `Exist: false` with a nil error**,
+  reserving errors for lookups that actually failed.
+
 A backend is rooted at a "current working directory"; object paths are relative
 to it. `SubStorage` returns a `Storager` rooted at a sub-path, so the whole tree
 is navigable through the same interface. Also provided: `storages.ErrFileNotFound`
-(returned by `GetObject` when the object is absent) and `storages.Walk(ctx, st,
-parent)` (recursively lists every file under a storage).
+(returned by `GetObject` when the object is absent) and `storages.Walk(ctx, st)`
+(recursively lists every file under a storage).
 
 Once constructed, every backend behaves the same, so write your code against
 `Storager` and let the caller decide where the bytes land:
@@ -68,7 +97,7 @@ func report(ctx context.Context, st storages.Storager) ([]string, error) {
 	if err := st.PutObject(ctx, "reports/2023.txt", strings.NewReader("annual report")); err != nil {
 		return nil, err
 	}
-	return storages.Walk(ctx, st, "") // -> ["reports/2023.txt"]
+	return storages.Walk(ctx, st) // -> ["reports/2023.txt"]
 }
 ```
 
@@ -145,6 +174,10 @@ st, err := ssh.NewStorage(ssh.Config{
 defer st.Close() // closes the shared SSH connection
 ```
 
+`SubStorage` clones share the parent's connection, so closing any of them closes
+it for all. Operations on a closed storage return `ssh.ErrStorageClosed`, which
+you can test for with `errors.Is`.
+
 ### In-memory
 
 A full, conformant backend that keeps everything in memory — no I/O, no
@@ -159,6 +192,53 @@ the `Storager` interface. To pick one from config, a small type switch in your
 own code is all it takes. The `directory` and `inmemory` backends share one
 implementation, so they behave identically — handy for tests. Object paths use
 forward slashes on every OS (Linux, macOS, Windows).
+
+## Writing your own backend
+
+`Storager` is a small interface, and nothing here is closed to extension — a
+backend living in your own repository is a first-class one. To check that it
+behaves like the built-in backends, run the shared conformance suite against it:
+
+```go
+func TestMyBackend(t *testing.T) {
+	storagetest.Run(t, func(t *testing.T) storages.Storager {
+		return mybackend.New(t.TempDir()) // fresh, empty, writable
+	})
+}
+```
+
+`storagetest` imports nothing but the standard library and `storages` itself, so
+no test framework is ever compiled into your module or written to your `vendor/`
+directory.
+
+## Development
+
+The main module needs no Docker: each backend's unit tests drive its API seam
+with test doubles, and the ssh backend's connection tests run against an
+in-process SFTP server.
+
+```sh
+make test       # the whole main module, everywhere
+make test-race  # same, under the race detector
+make lint
+```
+
+End-to-end tests against real servers — MinIO, Azurite and OpenSSH in
+containers — live in [`tests/integration`](tests/integration), a separate module
+so that `testcontainers` (and the ~50 modules behind it) stays out of the
+published dependency graph. They need Docker:
+
+```sh
+make test-integration
+```
+
+Within the main module, `testify` is allowed in `_test.go` files and banned
+everywhere else. A `_test.go` file is never compiled on a consumer's side, so
+the framework costs them nothing there. A non-test file is a different matter:
+in `storagetest` it would pull `testify` into every importer's test builds and
+`vendor/` directory, and in `internal/fsbackend` it would reach their production
+binaries, since that package is compiled into the s3, ssh and directory
+backends. `tests/integration` is a separate module and is not bound by this.
 
 ## License
 

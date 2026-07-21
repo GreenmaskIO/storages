@@ -185,30 +185,48 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 }
 
 func (s *Storage) Delete(_ context.Context, filePaths ...string) error {
-	for _, fp := range filePaths {
-		fullPath := path.Join(s.cwd, toSlash(fp))
-		info, err := s.fs.Stat(native(fullPath))
-		if err != nil {
-			// Deleting a missing object is not an error.
-			if errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			return err
+	// Verify every path before removing anything, so a request naming one bad
+	// path leaves the storage untouched rather than partly deleted.
+	fullPaths := make([]string, len(filePaths))
+	var missing []string
+	for i, fp := range filePaths {
+		fullPaths[i] = path.Join(s.cwd, toSlash(fp))
+		info, err := s.fs.Stat(native(fullPaths[i]))
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			missing = append(missing, fp)
+		case err != nil:
+			return fmt.Errorf("error checking %s: %w", fp, err)
+		case info.IsDir():
+			// Delete is object-level. A directory is not an object, and on an
+			// object store this path would simply not resolve to a key, so it
+			// is reported the same way here. DeleteAll removes sub-trees.
+			missing = append(missing, fp)
 		}
-		if info.IsDir() {
-			err = s.fs.RemoveAll(native(fullPath))
-		} else {
-			err = s.fs.Remove(native(fullPath))
-		}
-		if err != nil {
-			return fmt.Errorf("error deleting %s: %w", fp, err)
+	}
+	if len(missing) > 0 {
+		return &storages.MissingObjectsError{Paths: missing}
+	}
+
+	for i, fullPath := range fullPaths {
+		// A path that vanished between the check above and here means someone
+		// else removed it; the caller's intent is satisfied either way.
+		if err := s.fs.Remove(native(fullPath)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("error deleting %s: %w", filePaths[i], err)
 		}
 	}
 	return nil
 }
 
 func (s *Storage) DeleteAll(_ context.Context, pathPrefix string) error {
-	if err := s.fs.RemoveAll(native(path.Join(s.cwd, toSlash(pathPrefix)))); err != nil {
+	fullPath := path.Join(s.cwd, toSlash(pathPrefix))
+	if _, err := s.fs.Stat(native(fullPath)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return &storages.MissingObjectsError{Paths: []string{pathPrefix}}
+		}
+		return fmt.Errorf("error checking %s: %w", pathPrefix, err)
+	}
+	if err := s.fs.RemoveAll(native(fullPath)); err != nil {
 		return fmt.Errorf("error deleting %s: %w", pathPrefix, err)
 	}
 	return nil

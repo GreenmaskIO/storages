@@ -1,3 +1,21 @@
+// Copyright 2023 Greenmask
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The end-to-end tests against a real MinIO server live in the tests/integration
+// module, which keeps testcontainers out of this module's dependency graph.
+// What stays here drives the s3API/uploaderAPI seams with test doubles.
+
 package s3
 
 import (
@@ -7,9 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +37,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go/modules/minio"
 
 	"github.com/greenmaskio/storages"
 )
@@ -485,11 +500,14 @@ func TestStorage_Stat(t *testing.T) {
 		fileName    string
 		headErr     error
 		wantName    string
+		wantAbsent  bool
 		wantErrText string
 	}{
 		{name: "present builds full path name", prefix: "dumps/", fileName: "a.txt", wantName: "dumps/a.txt"},
 		{name: "name keeps prefix and is not stripped", prefix: "a/b/", fileName: "c.txt", wantName: "a/b/c.txt"},
-		{name: "not found is an error not Exist=false", prefix: "dumps/", fileName: "a.txt", headErr: &types.NotFound{}, wantName: "dumps/a.txt", wantErrText: "error getting object info"},
+		{name: "typed NotFound reports Exist=false, not an error", prefix: "dumps/", fileName: "a.txt", headErr: &types.NotFound{}, wantName: "dumps/a.txt", wantAbsent: true},
+		{name: "typed NoSuchKey reports Exist=false", prefix: "dumps/", fileName: "a.txt", headErr: &types.NoSuchKey{}, wantName: "dumps/a.txt", wantAbsent: true},
+		{name: "apierr NotFound code reports Exist=false", prefix: "dumps/", fileName: "a.txt", headErr: apiErr(NotFountAwsErrorCode), wantName: "dumps/a.txt", wantAbsent: true},
 		{name: "other error wrapped", prefix: "dumps/", fileName: "a.txt", headErr: errors.New("boom"), wantName: "dumps/a.txt", wantErrText: "error getting object info"},
 	}
 
@@ -518,6 +536,12 @@ func TestStorage_Stat(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.NotNil(t, stat)
+			if tt.wantAbsent {
+				assert.False(t, stat.Exist)
+				assert.Equal(t, tt.wantName, stat.Name)
+				svc.AssertExpectations(t)
+				return
+			}
 			assert.Equal(t, tt.wantName, stat.Name)
 			assert.True(t, stat.Exist)
 			assert.True(t, stat.LastModified.Equal(modTime), "LastModified = %v", stat.LastModified)
@@ -583,8 +607,10 @@ func TestStorage_Delete(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Arrange
+			// Arrange: every key verifies as present, so batching is what the
+			// assertions below actually observe.
 			svc := &mockS3{}
+			svc.On("HeadObject", mock.Anything, mock.Anything).Return(&s3.HeadObjectOutput{}, nil).Maybe()
 			svc.On("DeleteObjects", mock.Anything, mock.Anything).Return(&s3.DeleteObjectsOutput{}, nil).Maybe()
 			st := newStorage(t, tt.prefix, svc, nil)
 
@@ -601,6 +627,7 @@ func TestStorage_Delete(t *testing.T) {
 func TestStorage_Delete_ErrorStopsBatching(t *testing.T) {
 	// Arrange: first batch succeeds, the second fails, so batching must stop.
 	svc := &mockS3{}
+	svc.On("HeadObject", mock.Anything, mock.Anything).Return(&s3.HeadObjectOutput{}, nil).Maybe()
 	svc.On("DeleteObjects", mock.Anything, mock.Anything).Return(&s3.DeleteObjectsOutput{}, nil).Once()
 	svc.On("DeleteObjects", mock.Anything, mock.Anything).Return(nil, errors.New("s3 failure")).Once()
 	st := newStorage(t, "dumps/", svc, nil)
@@ -614,6 +641,61 @@ func TestStorage_Delete_ErrorStopsBatching(t *testing.T) {
 	assert.Contains(t, err.Error(), "s3 failure")
 	assert.Len(t, svc.deleteBatches(), 2, "batching should stop after the failing call")
 	svc.AssertExpectations(t)
+}
+
+func TestStorage_Delete_VerifiesBeforeDeleting(t *testing.T) {
+	t.Run("a missing key deletes nothing and is reported", func(t *testing.T) {
+		// Arrange: "a.txt" is present, "ghost.txt" is not.
+		svc := &mockS3{}
+		svc.On("HeadObject", mock.Anything, mock.MatchedBy(func(in *s3.HeadObjectInput) bool {
+			return aws.ToString(in.Key) == "dumps/a.txt"
+		})).Return(&s3.HeadObjectOutput{}, nil)
+		svc.On("HeadObject", mock.Anything, mock.MatchedBy(func(in *s3.HeadObjectInput) bool {
+			return aws.ToString(in.Key) == "dumps/ghost.txt"
+		})).Return(nil, &types.NotFound{})
+		st := newStorage(t, "dumps/", svc, nil)
+
+		// Act
+		err := st.Delete(context.Background(), "a.txt", "ghost.txt")
+
+		// Assert
+		assert.ErrorIs(t, err, storages.ErrFileNotFound)
+		var missing *storages.MissingObjectsError
+		require.ErrorAs(t, err, &missing)
+		assert.Equal(t, []string{"ghost.txt"}, missing.Paths)
+		assert.Empty(t, svc.deleteBatches(), "a failed verification must delete nothing")
+	})
+
+	t.Run("a verification error other than not-found is wrapped", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("HeadObject", mock.Anything, mock.Anything).Return(nil, errors.New("boom"))
+		st := newStorage(t, "dumps/", svc, nil)
+
+		// Act
+		err := st.Delete(context.Background(), "a.txt")
+
+		// Assert
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "error checking object")
+		assert.NotErrorIs(t, err, storages.ErrFileNotFound)
+		assert.Empty(t, svc.deleteBatches())
+	})
+}
+
+func TestStorage_DeleteAll_EmptyPrefix(t *testing.T) {
+	// Arrange: nothing carries the prefix, which is the only sense in which a
+	// prefix can be missing on an object store.
+	svc := &mockS3{}
+	svc.On("ListObjectsV2", mock.Anything, mock.Anything).Return(&s3.ListObjectsV2Output{}, nil)
+	st := newStorage(t, "", svc, nil)
+
+	// Act
+	err := st.DeleteAll(context.Background(), "gone")
+
+	// Assert
+	assert.ErrorIs(t, err, storages.ErrFileNotFound)
+	assert.Empty(t, svc.deleteBatches())
 }
 
 func TestStorage_Ping(t *testing.T) {
@@ -789,6 +871,8 @@ func TestStorage_DeleteAll(t *testing.T) {
 
 	// Assert
 	require.NoError(t, err)
+	assert.Empty(t, svc.headKeys(),
+		"keys came from the walk, so DeleteAll must not re-check them with HeadObject")
 	batches := svc.deleteBatches()
 	require.Len(t, batches, 1)
 	assert.Equal(t,
@@ -796,190 +880,4 @@ func TestStorage_DeleteAll(t *testing.T) {
 		batches[0],
 		"every walked key must be deleted with the sub-storage prefix re-applied",
 	)
-}
-
-// ===========================================================================
-// Integration (real MinIO container, behind -short)
-// ===========================================================================
-
-var (
-	minioOnce      sync.Once
-	minioStorage   *Storage
-	minioContainer *minio.MinioContainer
-	minioErr       error
-)
-
-// TestMain terminates the shared MinIO container (if one was started) after the
-// whole package's tests have run.
-func TestMain(m *testing.M) {
-	code := m.Run()
-	if minioContainer != nil {
-		_ = minioContainer.Terminate(context.Background())
-	}
-	os.Exit(code)
-}
-
-// requireMinio lazily starts a single MinIO container shared by all integration
-// tests and returns a Storage rooted at its bucket. Container tests are skipped
-// under -short.
-func requireMinio(t *testing.T) *Storage {
-	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping MinIO container test in short mode")
-	}
-	minioOnce.Do(func() {
-		minioStorage, minioContainer, minioErr = startMinio(context.Background())
-	})
-	require.NoError(t, minioErr)
-	return minioStorage
-}
-
-func startMinio(ctx context.Context) (*Storage, *minio.MinioContainer, error) {
-	container, err := minio.Run(ctx, "minio/minio:latest")
-	if err != nil {
-		return nil, nil, fmt.Errorf("starting minio: %w", err)
-	}
-
-	endpoint, err := container.ConnectionString(ctx)
-	if err != nil {
-		return nil, container, fmt.Errorf("minio endpoint: %w", err)
-	}
-
-	const bucket = "test-bucket"
-	cfg := Config{
-		Bucket:          bucket,
-		Region:          "us-east-1",
-		Endpoint:        "http://" + endpoint,
-		AccessKeyId:     container.Username,
-		SecretAccessKey: container.Password,
-		ForcePathStyle:  true,
-		NoVerifySsl:     true,
-		StorageClass:    defaultStorageClass,
-		MaxPartSize:     defaultMaxPartSize,
-		MaxRetries:      defaultMaxRetries,
-	}
-	st, err := NewStorage(ctx, cfg, WithLogger(slog.New(slog.DiscardHandler)))
-	if err != nil {
-		return nil, container, fmt.Errorf("new storage: %w", err)
-	}
-
-	// The bucket has to exist before any object operations. The s3API seam does
-	// not expose CreateBucket, so reach the concrete client behind it.
-	client, ok := st.service.(*s3.Client)
-	if !ok {
-		return nil, container, fmt.Errorf("expected *s3.Client, got %T", st.service)
-	}
-	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		return nil, container, fmt.Errorf("create bucket: %w", err)
-	}
-	return st, container, nil
-}
-
-func TestStorage_Integration(t *testing.T) {
-	ctx := context.Background()
-	root := requireMinio(t)
-
-	t.Run("PutObject and GetObject round-trip", func(t *testing.T) {
-		// Arrange
-		st := root.SubStorage("it-roundtrip", true)
-		content := []byte("hello world")
-
-		// Act
-		require.NoError(t, st.PutObject(ctx, "file.txt", bytes.NewReader(content)))
-		reader, err := st.GetObject(ctx, "file.txt")
-		require.NoError(t, err)
-		defer reader.Close()
-		got, err := io.ReadAll(reader)
-
-		// Assert
-		require.NoError(t, err)
-		assert.Equal(t, content, got)
-	})
-
-	t.Run("GetObject on missing key returns ErrFileNotFound", func(t *testing.T) {
-		// Arrange
-		st := root.SubStorage("it-missing", true)
-
-		// Act
-		_, err := st.GetObject(ctx, "nope.txt")
-
-		// Assert
-		assert.ErrorIs(t, err, storages.ErrFileNotFound)
-	})
-
-	t.Run("Exists and Stat reflect real objects", func(t *testing.T) {
-		// Arrange
-		st := root.SubStorage("it-stat", true)
-		require.NoError(t, st.PutObject(ctx, "stat.txt", bytes.NewReader([]byte("body"))))
-
-		// Act
-		exists, err := st.Exists(ctx, "stat.txt")
-		require.NoError(t, err)
-		stat, statErr := st.Stat("stat.txt")
-		missing, missErr := st.Exists(ctx, "absent.txt")
-
-		// Assert
-		assert.True(t, exists)
-		require.NoError(t, statErr)
-		assert.True(t, stat.Exist)
-		assert.Contains(t, stat.Name, "stat.txt")
-		require.NoError(t, missErr)
-		assert.False(t, missing)
-	})
-
-	t.Run("ListDir separates files and sub-directories", func(t *testing.T) {
-		// Arrange
-		st := root.SubStorage("it-list", true)
-		require.NoError(t, st.PutObject(ctx, "root1.txt", bytes.NewReader([]byte("1"))))
-		require.NoError(t, st.PutObject(ctx, "root2.txt", bytes.NewReader([]byte("2"))))
-		require.NoError(t, st.PutObject(ctx, "d1/inner1.txt", bytes.NewReader([]byte("3"))))
-		require.NoError(t, st.PutObject(ctx, "d1/inner2.txt", bytes.NewReader([]byte("4"))))
-
-		// Act
-		files, dirs, err := st.ListDir(ctx)
-
-		// Assert
-		require.NoError(t, err)
-		assert.ElementsMatch(t, []string{"root1.txt", "root2.txt"}, files)
-		require.Len(t, dirs, 1)
-
-		subFiles, subDirs, err := dirs[0].ListDir(ctx)
-		require.NoError(t, err)
-		assert.ElementsMatch(t, []string{"inner1.txt", "inner2.txt"}, subFiles)
-		assert.Empty(t, subDirs)
-	})
-
-	t.Run("Delete removes a single object", func(t *testing.T) {
-		// Arrange
-		st := root.SubStorage("it-delete", true)
-		require.NoError(t, st.PutObject(ctx, "bye.txt", bytes.NewReader([]byte("bye"))))
-
-		// Act
-		require.NoError(t, st.Delete(ctx, "bye.txt"))
-
-		// Assert
-		exists, err := st.Exists(ctx, "bye.txt")
-		require.NoError(t, err)
-		assert.False(t, exists)
-	})
-
-	t.Run("DeleteAll recursively clears a sub-tree", func(t *testing.T) {
-		// Arrange
-		st := root.SubStorage("it-deleteall", true)
-		require.NoError(t, st.PutObject(ctx, "victims/a.txt", bytes.NewReader([]byte("a"))))
-		require.NoError(t, st.PutObject(ctx, "victims/nested/b.txt", bytes.NewReader([]byte("b"))))
-
-		// Act
-		require.NoError(t, st.DeleteAll(ctx, "victims"))
-
-		// Assert
-		files, err := storages.Walk(ctx, st.SubStorage("victims", true), "")
-		require.NoError(t, err)
-		assert.Empty(t, files)
-	})
-
-	t.Run("Ping reaches the bucket", func(t *testing.T) {
-		// Act & Assert
-		assert.NoError(t, root.Ping(ctx))
-	})
 }

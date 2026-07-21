@@ -56,9 +56,22 @@ type Storager interface {
 	// PutObject writes body to the object at filePath, creating any intermediate
 	// directories as needed.
 	PutObject(ctx context.Context, filePath string, body io.Reader) error
-	// Delete removes the named objects. Deleting a missing object is not an error.
+	// Delete removes the named objects. It is object-level and never recursive:
+	// a path naming a directory rather than an object is not deleted. Use
+	// DeleteAll to remove a sub-tree.
+	//
+	// Every path is verified before anything is removed. If any path is not an
+	// existing object — absent, or a directory — nothing is deleted and the
+	// error is a *MissingObjectsError listing them, which wraps ErrFileNotFound.
+	// Delete is therefore not idempotent: deleting the same object twice fails
+	// the second time.
 	Delete(ctx context.Context, filePaths ...string) error
-	// DeleteAll recursively removes everything under pathPrefix.
+	// DeleteAll recursively removes everything under pathPrefix, including the
+	// prefix "directory" itself on backends that have real directories.
+	//
+	// A prefix holding nothing is a *MissingObjectsError wrapping
+	// ErrFileNotFound, so DeleteAll is likewise not idempotent: re-running a
+	// deletion that already succeeded fails.
 	DeleteAll(ctx context.Context, pathPrefix string) error
 	// Exists reports whether fileName exists in the current directory.
 	Exists(ctx context.Context, fileName string) (bool, error)
@@ -67,8 +80,9 @@ type Storager interface {
 	// an absolute root. The returned storage shares the parent's connection and
 	// configuration.
 	SubStorage(subPath string, relative bool) Storager
-	// Stat returns metadata about fileName. Backends report a non-existent object
-	// via ObjectStat.Exist rather than an error where practical.
+	// Stat returns metadata about fileName. A non-existent object is reported via
+	// ObjectStat.Exist being false with a nil error; an error means the lookup
+	// itself failed.
 	Stat(fileName string) (*ObjectStat, error)
 	// Ping checks connectivity/reachability of the underlying storage. It forces
 	// a real connection where the backend connects lazily.

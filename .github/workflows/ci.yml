@@ -9,10 +9,12 @@ permissions:
   contents: read
 
 jobs:
-  # Cross-platform validation: the filesystem-like backends (directory over
-  # afero.OsFs, inmemory over afero.MemMapFs) run the same conformance suite on
-  # every supported OS. These need no Docker, so they run on the full matrix and
-  # catch path/separator regressions on Windows.
+  # The whole main module needs no Docker: the backends' unit tests drive their
+  # API seams with test doubles, and the ssh backend's connection tests use an
+  # in-process SFTP server. That means the full matrix runs everywhere, which
+  # doubles as cross-platform validation for the filesystem-like backends
+  # (directory over afero.OsFs, inmemory over afero.MemMapFs) and catches
+  # path/separator regressions on Windows.
   test:
     strategy:
       fail-fast: false
@@ -26,25 +28,35 @@ jobs:
           go-version-file: go.mod
       - name: Build
         run: go build ./...
-      - name: Test (fs backends + shared code)
-        run: go test ./ ./directory/... ./inmemory/... ./internal/...
+      - name: Test
+        run: go test ./...
 
-  # The s3/azure/ssh unit tests spin up containers via testcontainers, so they
-  # run on Ubuntu where Docker is available. This job also carries the race
-  # detector for the whole module: Linux is the only runner we make CGO
-  # toolchain assumptions on, and the packages gated behind Docker include the
-  # ones with shared mutable state (ssh's lazily-established, clone-shared
-  # connection), so restricting -race to the Docker-free packages would skip
-  # exactly the code most worth checking.
-  test-docker:
+  # The race detector for the main module. Linux is the only runner we make CGO
+  # toolchain assumptions on, and it covers the code with shared mutable state
+  # (ssh's lazily-established, clone-shared connection).
+  test-race:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test with race detector (all backends)
-        run: go test -race ./...
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+  # End-to-end tests against real servers (MinIO, Azurite, OpenSSH) live in
+  # their own module so that testcontainers stays out of the published
+  # dependency graph. They need Docker, so they only run on Ubuntu.
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test against real backends
+        run: go test -count=1 -timeout 20m ./...
+        working-directory: tests/integration
 
   lint:
     runs-on: ubuntu-latest

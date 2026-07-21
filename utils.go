@@ -20,30 +20,37 @@ import (
 	"path"
 )
 
-var (
-	ErrFileNotFound = fmt.Errorf("file not found")
-)
+// Walk recursively lists every file under st, returning slash-separated paths
+// relative to st's current working directory. Directories are not included in
+// the result — only the files within them.
+func Walk(ctx context.Context, st Storager) ([]string, error) {
+	return walk(ctx, st, "")
+}
 
-func Walk(ctx context.Context, st Storager, parent string) (res []string, err error) {
-	var files []string
+// walk carries the accumulated path prefix through the recursion. It is
+// unexported so that Walk's own signature does not expose it: every caller
+// starts at st's root.
+func walk(ctx context.Context, st Storager, parent string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	files, dirs, err := st.ListDir(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error listing directory: %w", err)
 	}
+
+	res := make([]string, 0, len(files))
 	for _, f := range files {
 		res = append(res, path.Join(parent, f))
 	}
-	if len(dirs) > 0 {
-		for _, d := range dirs {
-			subFiles, err := Walk(ctx, d, d.Dirname())
-			if err != nil {
-				return nil, fmt.Errorf("error walking through directory: %w", err)
-			}
-			for _, f := range subFiles {
-				res = append(res, path.Join(parent, f))
-			}
+	for _, d := range dirs {
+		subFiles, err := walk(ctx, d, path.Join(parent, d.Dirname()))
+		if err != nil {
+			return nil, fmt.Errorf("error walking through directory: %w", err)
 		}
+		res = append(res, subFiles...)
 	}
 
-	return
+	return res, nil
 }

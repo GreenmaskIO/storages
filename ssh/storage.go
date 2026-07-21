@@ -238,28 +238,34 @@ func (s *Storage) Delete(ctx context.Context, filePaths ...string) error {
 		return err
 	}
 
-	for _, fp := range filePaths {
-		objPath := path.Join(s.cwd, fp)
+	// Verify every path before removing anything, so a request naming one bad
+	// path leaves the storage untouched rather than partly deleted.
+	objPaths := make([]string, len(filePaths))
+	var missing []string
+	for i, fp := range filePaths {
+		objPaths[i] = path.Join(s.cwd, fp)
 
-		stat, err := client.Stat(objPath)
-		if errors.Is(err, os.ErrNotExist) {
-			// Idempotent: a missing file is not an error.
-			continue
+		stat, err := client.Stat(objPaths[i])
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			missing = append(missing, fp)
+		case err != nil:
+			return fmt.Errorf("get stats of object %q via SFTP: %w", objPaths[i], err)
+		case stat.IsDir():
+			// Delete is object-level; a directory is not an object. DeleteAll
+			// removes sub-trees.
+			missing = append(missing, fp)
 		}
-		if err != nil {
-			return fmt.Errorf("get stats of object %q via SFTP: %w", objPath, err)
-		}
-		// Do not try to remove a directory. It may be non-empty.
-		if stat.IsDir() {
-			continue
-		}
+	}
+	if len(missing) > 0 {
+		return &storages.MissingObjectsError{Paths: missing}
+	}
 
-		err = client.Remove(objPath)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("delete object %q via SFTP: %w", objPath, err)
+	for i, objPath := range objPaths {
+		// A path that vanished between the check above and here means someone
+		// else removed it; the caller's intent is satisfied either way.
+		if err := client.Remove(objPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("delete object %q via SFTP: %w", filePaths[i], err)
 		}
 	}
 	return nil
@@ -270,11 +276,23 @@ func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
 	if err != nil {
 		return err
 	}
+	fullPath := path.Join(s.cwd, pathPrefix)
+
+	// The prefix itself must exist; removeAll tolerates a missing path so that
+	// concurrent removal deeper in the tree is not an error, but the top-level
+	// target being absent is what the caller needs to hear about.
+	if _, err := client.Stat(fullPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &storages.MissingObjectsError{Paths: []string{pathPrefix}}
+		}
+		return fmt.Errorf("get stats of %q via SFTP: %w", fullPath, err)
+	}
+
 	// Mirror os.RemoveAll: remove everything under the prefix, including the now
 	// empty directories and the prefix directory itself. SFTP has no recursive
 	// remove, and leaving the emptied directories behind would make a deleted
 	// dump still surface in list-dumps as an empty, status-less directory.
-	if err := removeAll(client, path.Join(s.cwd, pathPrefix)); err != nil {
+	if err := removeAll(client, fullPath); err != nil {
 		return fmt.Errorf("error deleting %q: %w", pathPrefix, err)
 	}
 	return nil

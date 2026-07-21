@@ -32,8 +32,8 @@ require (
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/samber/lo v1.53.0 // indirect
 	github.com/samber/slog-common v0.21.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 )
 
 replace github.com/greenmaskio/storages => ../..

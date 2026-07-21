@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package inmemory
+package azure
 
 import (
 	"testing"
@@ -21,8 +21,10 @@ import (
 	"github.com/greenmaskio/storages/storagetest"
 )
 
+// TestConformance holds this backend to the same Storager contract as every
+// other one. Each case gets its own freshly created blob container.
 func TestConformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storages.Storager {
-		return New("")
+		return newTestStorage(t)
 	})
 }

@@ -1,4 +1,4 @@
-// Copyright 2023 Greenmask
+// Copyright 2026 Greenmask
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package inmemory
+package ssh
 
 import (
 	"testing"
@@ -21,8 +21,10 @@ import (
 	"github.com/greenmaskio/storages/storagetest"
 )
 
+// TestConformance holds this backend to the same Storager contract as every
+// other one. Each case gets its own unique prefix in the shared SFTP container.
 func TestConformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storages.Storager {
-		return New("")
+		return newTestStorage(t)
 	})
 }

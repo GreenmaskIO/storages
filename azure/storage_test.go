@@ -12,20 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The end-to-end tests against the Azurite emulator live in the tests/integration
+// module, which keeps testcontainers out of this module's dependency graph. What
+// stays here drives the containerAPI/blockBlobAPI seams with test doubles.
 package azure
 
 import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,8 +39,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/azure/azurite"
 
 	"github.com/greenmaskio/storages"
 )
@@ -244,6 +241,14 @@ func TestApiVersionPolicy(t *testing.T) {
 	}
 }
 
+// devAccountName / devAccountKey are the well-known Azure Storage development
+// account credentials. Nothing here talks to a server; they are only used to
+// build clients.
+const (
+	devAccountName = "devstoreaccount1"
+	devAccountKey  = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+)
+
 // TestNewStorage_AuthDispatch verifies that every auth method builds a usable
 // container client (no network calls are made by client construction).
 func TestNewStorage_AuthDispatch(t *testing.T) {
@@ -251,14 +256,14 @@ func TestNewStorage_AuthDispatch(t *testing.T) {
 		name      string
 		configure func(*Config)
 	}{
-		{"access key", func(c *Config) { c.AccessKey = azurite.AccountKey }},
+		{"access key", func(c *Config) { c.AccessKey = devAccountKey }},
 		{"sas token", func(c *Config) { c.SASToken = "sig=abc&se=2030-01-01" }},
 		{"default credential chain", func(c *Config) {}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := DefaultConfig()
-			cfg.StorageAccount = azurite.AccountName
+			cfg.StorageAccount = devAccountName
 			cfg.Container = "cont"
 			cfg.Endpoint = "http://127.0.0.1:10000/devstoreaccount1"
 			tt.configure(&cfg)
@@ -419,11 +424,21 @@ func (m *mockBlockBlob) GetProperties(
 	return out, args.Error(1)
 }
 
-// deleteBlob returns a block-blob double whose Delete yields the given error
-// (nil for success, blobNotFound() to exercise the skip-missing path).
+// deleteBlob returns a block-blob double that exists (GetProperties succeeds)
+// and whose Delete yields the given error.
 func deleteBlob(err error) *mockBlockBlob {
 	b := &mockBlockBlob{}
+	b.On("GetProperties", mock.Anything, mock.Anything).Return(blob.GetPropertiesResponse{}, nil)
 	b.On("Delete", mock.Anything, mock.Anything).Return(blob.DeleteResponse{}, err)
+	return b
+}
+
+// probeBlob returns a block-blob double whose GetProperties yields the given
+// error, for exercising Delete's verification pass. Its Delete must never be
+// called: a failed verification deletes nothing.
+func probeBlob(err error) *mockBlockBlob {
+	b := &mockBlockBlob{}
+	b.On("GetProperties", mock.Anything, mock.Anything).Return(blob.GetPropertiesResponse{}, err)
 	return b
 }
 
@@ -679,11 +694,12 @@ func TestStorage_Stat(t *testing.T) {
 		fileName     string
 		getErr       error
 		wantBlobName string
+		wantAbsent   bool
 		wantErrText  string
 	}{
 		{name: "present builds full path name", prefix: "dumps/", fileName: "a.txt", wantBlobName: "dumps/a.txt"},
 		{name: "name keeps prefix and is not stripped", prefix: "a/b/", fileName: "c.txt", wantBlobName: "a/b/c.txt"},
-		{name: "not found is an error not Exist=false", prefix: "dumps/", fileName: "a.txt", getErr: blobNotFound(), wantBlobName: "dumps/a.txt", wantErrText: "error getting object info"},
+		{name: "BlobNotFound reports Exist=false, not an error", prefix: "dumps/", fileName: "a.txt", getErr: blobNotFound(), wantBlobName: "dumps/a.txt", wantAbsent: true},
 		{name: "other error wrapped", prefix: "dumps/", fileName: "a.txt", getErr: errors.New("boom"), wantBlobName: "dumps/a.txt", wantErrText: "error getting object info"},
 	}
 	for _, tt := range tests {
@@ -715,6 +731,10 @@ func TestStorage_Stat(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, stat)
 			assert.Equal(t, tt.wantBlobName, stat.Name)
+			if tt.wantAbsent {
+				assert.False(t, stat.Exist)
+				return
+			}
 			assert.True(t, stat.Exist)
 			assert.True(t, stat.LastModified.Equal(modTime), "LastModified = %v", stat.LastModified)
 		})
@@ -722,65 +742,99 @@ func TestStorage_Stat(t *testing.T) {
 }
 
 func TestStorage_Delete(t *testing.T) {
-	tests := []struct {
-		name          string
-		prefix        string
-		paths         []string
-		errByBlobName map[string]error
-		wantBlobNames []string
-		wantErrText   string
-	}{
-		{
-			name:          "deletes each path with prefix",
-			prefix:        "dumps/",
-			paths:         []string{"a.txt", "b.txt"},
-			wantBlobNames: []string{"dumps/a.txt", "dumps/b.txt"},
-		},
-		{
-			name:          "trims leading slash",
-			prefix:        "dumps/",
-			paths:         []string{"/a.txt"},
-			wantBlobNames: []string{"dumps/a.txt"},
-		},
-		{
-			name:          "not found is skipped, not an error",
-			prefix:        "dumps/",
-			paths:         []string{"a.txt", "ghost.txt"},
-			errByBlobName: map[string]error{"dumps/ghost.txt": blobNotFound()},
-			wantBlobNames: []string{"dumps/a.txt", "dumps/ghost.txt"},
-		},
-		{
-			name:          "other error wraps and stops",
-			prefix:        "dumps/",
-			paths:         []string{"a.txt", "b.txt", "c.txt"},
-			errByBlobName: map[string]error{"dumps/b.txt": errors.New("boom")},
-			wantBlobNames: []string{"dumps/a.txt", "dumps/b.txt"},
-			wantErrText:   "error deleting object",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Arrange: one block-blob double per requested name, returning that
-			// name's injected error (nil / BlobNotFound / other).
-			c := &mockContainer{}
-			for _, name := range tt.wantBlobNames {
-				c.On("NewBlockBlobClient", name).Return(deleteBlob(tt.errByBlobName[name]))
-			}
-			st := newMockStorage(t, tt.prefix, c)
+	// Delete verifies every blob before removing any, so each requested path is
+	// resolved twice on the happy path: once by the verification pass and once
+	// by the delete pass.
+	t.Run("deletes each path with prefix", func(t *testing.T) {
+		// Arrange
+		c := &mockContainer{}
+		for _, name := range []string{"dumps/a.txt", "dumps/b.txt"} {
+			c.On("NewBlockBlobClient", name).Return(deleteBlob(nil))
+		}
+		st := newMockStorage(t, "dumps/", c)
 
-			// Act
-			err := st.Delete(context.Background(), tt.paths...)
+		// Act
+		err := st.Delete(context.Background(), "a.txt", "b.txt")
 
-			// Assert
-			assert.Equal(t, tt.wantBlobNames, c.blobNames)
-			if tt.wantErrText != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErrText)
-				return
-			}
-			assert.NoError(t, err)
-		})
-	}
+		// Assert
+		require.NoError(t, err)
+		assert.Equal(t,
+			[]string{"dumps/a.txt", "dumps/b.txt", "dumps/a.txt", "dumps/b.txt"},
+			c.blobNames,
+			"verification pass then delete pass",
+		)
+	})
+
+	t.Run("trims leading slash", func(t *testing.T) {
+		// Arrange
+		c := &mockContainer{}
+		c.On("NewBlockBlobClient", "dumps/a.txt").Return(deleteBlob(nil))
+		st := newMockStorage(t, "dumps/", c)
+
+		// Act & Assert
+		require.NoError(t, st.Delete(context.Background(), "/a.txt"))
+		assert.Equal(t, []string{"dumps/a.txt", "dumps/a.txt"}, c.blobNames)
+	})
+
+	t.Run("missing blob deletes nothing and is reported", func(t *testing.T) {
+		// Arrange: "a.txt" is present, "ghost.txt" is not. The doubles for both
+		// would panic if Delete were called, since only GetProperties is set up
+		// on the probe and the verification pass must abort before deleting.
+		c := &mockContainer{}
+		c.On("NewBlockBlobClient", "dumps/a.txt").Return(probeBlob(nil))
+		c.On("NewBlockBlobClient", "dumps/ghost.txt").Return(probeBlob(blobNotFound()))
+		st := newMockStorage(t, "dumps/", c)
+
+		// Act
+		err := st.Delete(context.Background(), "a.txt", "ghost.txt")
+
+		// Assert
+		assert.ErrorIs(t, err, storages.ErrFileNotFound)
+		var missing *storages.MissingObjectsError
+		require.ErrorAs(t, err, &missing)
+		assert.Equal(t, []string{"ghost.txt"}, missing.Paths)
+		assert.Equal(t,
+			[]string{"dumps/a.txt", "dumps/ghost.txt"}, c.blobNames,
+			"only the verification pass runs; nothing is deleted",
+		)
+	})
+
+	t.Run("verification error other than not-found is wrapped", func(t *testing.T) {
+		// Arrange
+		c := &mockContainer{}
+		c.On("NewBlockBlobClient", "dumps/a.txt").Return(probeBlob(nil))
+		c.On("NewBlockBlobClient", "dumps/b.txt").Return(probeBlob(errors.New("boom")))
+		st := newMockStorage(t, "dumps/", c)
+
+		// Act
+		err := st.Delete(context.Background(), "a.txt", "b.txt")
+
+		// Assert
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "error checking object")
+		assert.NotErrorIs(t, err, storages.ErrFileNotFound)
+	})
+
+	t.Run("delete error is wrapped and stops", func(t *testing.T) {
+		// Arrange: both verify fine, but removing "b.txt" fails.
+		c := &mockContainer{}
+		c.On("NewBlockBlobClient", "dumps/a.txt").Return(deleteBlob(nil))
+		c.On("NewBlockBlobClient", "dumps/b.txt").Return(deleteBlob(errors.New("boom")))
+		c.On("NewBlockBlobClient", "dumps/c.txt").Return(deleteBlob(nil))
+		st := newMockStorage(t, "dumps/", c)
+
+		// Act
+		err := st.Delete(context.Background(), "a.txt", "b.txt", "c.txt")
+
+		// Assert
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "error deleting object")
+		assert.Equal(t,
+			[]string{"dumps/a.txt", "dumps/b.txt", "dumps/c.txt", "dumps/a.txt", "dumps/b.txt"},
+			c.blobNames,
+			"all three verified, then deletion stops at the failing blob",
+		)
+	})
 }
 
 func TestStorage_Ping(t *testing.T) {
@@ -875,472 +929,4 @@ func TestStorage_DeleteAll(t *testing.T) {
 		c.blobNames,
 		"every walked key must be deleted with the sub-storage prefix re-applied",
 	)
-}
-
-// ===========================================================================
-// Integration (real Azurite emulator, behind -short)
-//
-// A single Azurite container is shared across all integration tests (started
-// lazily on first use, terminated in TestMain). Each subtest gets its own
-// freshly created blob container via newTestStorage, so cases stay isolated.
-// ===========================================================================
-
-const azuriteImage = "mcr.microsoft.com/azure-storage/azurite:latest"
-
-var (
-	azuriteOnce    sync.Once
-	azuriteCtr     *azurite.Container
-	azuriteBlobURL string
-	azuriteErr     error
-
-	containerCounter atomic.Int64
-)
-
-func TestMain(m *testing.M) {
-	code := m.Run()
-	if azuriteCtr != nil {
-		_ = azuriteCtr.Terminate(context.Background())
-	}
-	os.Exit(code)
-}
-
-// azuriteEndpoint lazily starts the shared Azurite container and returns the
-// blob service URL. Integration tests are skipped under -short.
-// --skipApiVersionCheck lets the emulator accept the API version sent by the
-// current Azure SDK.
-func azuriteEndpoint(t *testing.T) string {
-	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping Azurite container test in short mode")
-	}
-	azuriteOnce.Do(func() {
-		ctx := context.Background()
-		azuriteCtr, azuriteErr = azurite.Run(
-			ctx, azuriteImage,
-			azurite.WithEnabledServices(azurite.BlobService),
-			testcontainers.WithCmdArgs("--skipApiVersionCheck"),
-		)
-		if azuriteErr != nil {
-			return
-		}
-		azuriteBlobURL, azuriteErr = azuriteCtr.BlobServiceURL(ctx)
-	})
-	require.NoError(t, azuriteErr)
-	return azuriteBlobURL
-}
-
-// newTestStorage returns a Storage backed by a unique, freshly created blob
-// container in the shared Azurite emulator.
-func newTestStorage(t *testing.T) *Storage {
-	t.Helper()
-	ctx := context.Background()
-	endpoint := azuriteEndpoint(t)
-
-	cfg := DefaultConfig()
-	// Path-style endpoint includes the account name (Azurite well-known account).
-	cfg.Endpoint = fmt.Sprintf("%s/%s", endpoint, azurite.AccountName)
-	cfg.StorageAccount = azurite.AccountName
-	cfg.AccessKey = azurite.AccountKey
-	cfg.Container = fmt.Sprintf("test-%d", containerCounter.Add(1))
-
-	st, err := NewStorage(ctx, cfg)
-	require.NoError(t, err)
-	_, err = st.containerClient.Create(ctx, nil)
-	require.NoError(t, err)
-	return st
-}
-
-// putObject is a small helper that writes content under key.
-func putObject(t *testing.T, st *Storage, key string, content []byte) {
-	t.Helper()
-	require.NoError(t, st.PutObject(context.Background(), key, bytes.NewReader(content)))
-}
-
-// mustGet reads the object at key and returns its bytes.
-func mustGet(t *testing.T, st *Storage, key string) []byte {
-	t.Helper()
-	r, err := st.GetObject(context.Background(), key)
-	require.NoError(t, err)
-	defer func() { _ = r.Close() }()
-	data, err := io.ReadAll(r)
-	require.NoError(t, err)
-	return data
-}
-
-// rawListBlobs lists every blob in the container directly through the SDK,
-// independent of the Storager implementation. It is used to cross-check that
-// the storage actually holds (or no longer holds) the expected objects.
-func rawListBlobs(t *testing.T, st *Storage) []string {
-	t.Helper()
-	ctx := context.Background()
-	var names []string
-	pager := st.containerClient.NewListBlobsFlatPager(nil)
-	for pager.More() {
-		page, err := pager.NextPage(ctx)
-		require.NoError(t, err)
-		for _, b := range page.Segment.BlobItems {
-			names = append(names, *b.Name)
-		}
-	}
-	return names
-}
-
-func dirNames(dirs []storages.Storager) []string {
-	names := make([]string, 0, len(dirs))
-	for _, d := range dirs {
-		names = append(names, d.Dirname())
-	}
-	return names
-}
-
-func mapKeys(m map[string][]byte) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
-}
-
-// TestStorage_Integration exercises every method against the real emulator.
-func TestStorage_Integration(t *testing.T) {
-	t.Run("PutObject", func(t *testing.T) {
-		tests := []struct {
-			name    string
-			key     string
-			content []byte
-		}{
-			{"root file", "file.txt", []byte("hello")},
-			{"nested file", "dir/file.txt", []byte("nested")},
-			{"deeply nested", "a/b/c/d.txt", []byte("deep")},
-			{"leading slash key is trimmed", "/slash.txt", []byte("slash")},
-			{"empty content", "empty.txt", []byte{}},
-			{"binary content", "bin.dat", []byte{0x00, 0x01, 0x02, 0xff, 0xfe}},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				st := newTestStorage(t)
-				putObject(t, st, tt.key, tt.content)
-				assert.Equal(t, tt.content, mustGet(t, st, tt.key))
-			})
-		}
-
-		t.Run("overwrite creates new version", func(t *testing.T) {
-			st := newTestStorage(t)
-			putObject(t, st, "v.txt", []byte("version-1"))
-			putObject(t, st, "v.txt", []byte("version-2"))
-			assert.Equal(t, []byte("version-2"), mustGet(t, st, "v.txt"))
-			// the overwrite must not leave a duplicate blob behind
-			assert.Equal(t, []string{"v.txt"}, rawListBlobs(t, st))
-		})
-	})
-
-	t.Run("GetObject", func(t *testing.T) {
-		tests := []struct {
-			name        string
-			putKey      string
-			getKey      string
-			wantContent []byte
-			wantErr     error
-		}{
-			{"existing root", "f.txt", "f.txt", []byte("data"), nil},
-			{"existing nested", "d/f.txt", "d/f.txt", []byte("nested"), nil},
-			{"missing key", "", "missing.txt", nil, storages.ErrFileNotFound},
-			{"leading slash matches put without slash", "f.txt", "/f.txt", []byte("data"), nil},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				st := newTestStorage(t)
-				if tt.putKey != "" {
-					putObject(t, st, tt.putKey, tt.wantContent)
-				}
-				reader, err := st.GetObject(context.Background(), tt.getKey)
-				if tt.wantErr != nil {
-					assert.ErrorIs(t, err, tt.wantErr)
-					return
-				}
-				require.NoError(t, err)
-				defer func() { _ = reader.Close() }()
-				data, err := io.ReadAll(reader)
-				require.NoError(t, err)
-				assert.Equal(t, tt.wantContent, data)
-			})
-		}
-	})
-
-	t.Run("Exists", func(t *testing.T) {
-		tests := []struct {
-			name     string
-			put      []string
-			checkKey string
-			want     bool
-		}{
-			{"present root", []string{"a.txt"}, "a.txt", true},
-			{"present nested", []string{"d/a.txt"}, "d/a.txt", true},
-			{"absent", []string{"a.txt"}, "b.txt", false},
-			{"absent in empty container", nil, "a.txt", false},
-			{"prefix of existing key is not a blob", []string{"dir/a.txt"}, "dir", false},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				st := newTestStorage(t)
-				for _, k := range tt.put {
-					putObject(t, st, k, []byte("x"))
-				}
-				got, err := st.Exists(context.Background(), tt.checkKey)
-				require.NoError(t, err)
-				assert.Equal(t, tt.want, got)
-			})
-		}
-	})
-
-	t.Run("Stat", func(t *testing.T) {
-		tests := []struct {
-			name    string
-			putKey  string
-			statKey string
-			wantErr bool
-		}{
-			{"existing root", "f.txt", "f.txt", false},
-			{"existing nested", "d/f.txt", "d/f.txt", false},
-			{"missing", "", "missing.txt", true},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				st := newTestStorage(t)
-				if tt.putKey != "" {
-					putObject(t, st, tt.putKey, []byte("data"))
-				}
-				stat, err := st.Stat(tt.statKey)
-				if tt.wantErr {
-					assert.Error(t, err)
-					return
-				}
-				require.NoError(t, err)
-				assert.True(t, stat.Exist)
-				assert.Equal(t, tt.statKey, stat.Name)
-				assert.False(t, stat.LastModified.IsZero())
-			})
-		}
-	})
-
-	t.Run("ListDir", func(t *testing.T) {
-		tests := []struct {
-			name       string
-			put        []string
-			listPrefix string // "" lists the root storage, otherwise a relative SubStorage
-			wantFiles  []string
-			wantDirs   []string
-		}{
-			{
-				name:      "mixed files and dirs at root",
-				put:       []string{"a.txt", "b.txt", "d1/c.txt", "d2/e.txt"},
-				wantFiles: []string{"a.txt", "b.txt"},
-				wantDirs:  []string{"d1", "d2"},
-			},
-			{
-				name:      "only files",
-				put:       []string{"a.txt", "b.txt"},
-				wantFiles: []string{"a.txt", "b.txt"},
-				wantDirs:  nil,
-			},
-			{
-				name:     "only dirs",
-				put:      []string{"d1/a.txt", "d2/b.txt"},
-				wantDirs: []string{"d1", "d2"},
-			},
-			{
-				name: "empty container",
-			},
-			{
-				name:       "nested listing via sub storage",
-				put:        []string{"sub/x.txt", "sub/y.txt", "sub/deep/z.txt"},
-				listPrefix: "sub",
-				wantFiles:  []string{"x.txt", "y.txt"},
-				wantDirs:   []string{"deep"},
-			},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				st := newTestStorage(t)
-				for _, k := range tt.put {
-					putObject(t, st, k, []byte("x"))
-				}
-
-				var target storages.Storager = st
-				if tt.listPrefix != "" {
-					target = st.SubStorage(tt.listPrefix, true)
-				}
-
-				files, dirs, err := target.ListDir(context.Background())
-				require.NoError(t, err)
-				assert.ElementsMatch(t, tt.wantFiles, files)
-				assert.ElementsMatch(t, tt.wantDirs, dirNames(dirs))
-			})
-		}
-	})
-
-	t.Run("Delete", func(t *testing.T) {
-		tests := []struct {
-			name     string
-			put      []string
-			del      []string
-			wantGone []string
-			wantKept []string
-		}{
-			{"single", []string{"a.txt", "b.txt"}, []string{"a.txt"}, []string{"a.txt"}, []string{"b.txt"}},
-			{"multiple", []string{"a.txt", "b.txt", "c.txt"}, []string{"a.txt", "c.txt"}, []string{"a.txt", "c.txt"}, []string{"b.txt"}},
-			{"non-existent is ignored", []string{"a.txt"}, []string{"ghost.txt"}, []string{"ghost.txt"}, []string{"a.txt"}},
-			{"nested", []string{"d/a.txt", "d/b.txt"}, []string{"d/a.txt"}, []string{"d/a.txt"}, []string{"d/b.txt"}},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				ctx := context.Background()
-				st := newTestStorage(t)
-				for _, k := range tt.put {
-					putObject(t, st, k, []byte("x"))
-				}
-
-				require.NoError(t, st.Delete(ctx, tt.del...))
-
-				for _, k := range tt.wantGone {
-					exists, err := st.Exists(ctx, k)
-					require.NoError(t, err)
-					assert.Falsef(t, exists, "expected %q to be gone", k)
-				}
-				for _, k := range tt.wantKept {
-					exists, err := st.Exists(ctx, k)
-					require.NoError(t, err)
-					assert.Truef(t, exists, "expected %q to be kept", k)
-				}
-			})
-		}
-	})
-
-	t.Run("DeleteAll", func(t *testing.T) {
-		tests := []struct {
-			name          string
-			put           []string
-			deletePrefix  string
-			wantRemaining []string
-		}{
-			{
-				name:          "prefix isolation leaves other prefixes intact",
-				put:           []string{"books/a.txt", "books/b.txt", "users/u.txt"},
-				deletePrefix:  "books",
-				wantRemaining: []string{"users/u.txt"},
-			},
-			{
-				name:          "nested prefix only",
-				put:           []string{"books/sci/a.txt", "books/sci/b.txt", "books/hist/c.txt"},
-				deletePrefix:  "books/sci",
-				wantRemaining: []string{"books/hist/c.txt"},
-			},
-			{
-				name:          "similarly named prefix is not affected",
-				put:           []string{"data/a.txt", "data2/b.txt"},
-				deletePrefix:  "data",
-				wantRemaining: []string{"data2/b.txt"},
-			},
-			{
-				name:          "delete everything from root",
-				put:           []string{"a.txt", "d/b.txt", "d/e/c.txt"},
-				deletePrefix:  "/",
-				wantRemaining: nil,
-			},
-		}
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				st := newTestStorage(t)
-				for _, k := range tt.put {
-					putObject(t, st, k, []byte("x"))
-				}
-
-				require.NoError(t, st.DeleteAll(context.Background(), tt.deletePrefix))
-
-				// Cross-check directly against the storage, not via ListDir.
-				assert.ElementsMatch(t, tt.wantRemaining, rawListBlobs(t, st))
-			})
-		}
-	})
-
-	t.Run("SubStorage round-trip", func(t *testing.T) {
-		st := newTestStorage(t)
-		sub := st.SubStorage("Sub1", true)
-		content := []byte("sub-storage-payload")
-		require.NoError(t, sub.PutObject(context.Background(), "test.txt", bytes.NewReader(content)))
-
-		// readable through the sub storage
-		reader, err := sub.GetObject(context.Background(), "test.txt")
-		require.NoError(t, err)
-		defer func() { _ = reader.Close() }()
-		data, err := io.ReadAll(reader)
-		require.NoError(t, err)
-		assert.Equal(t, content, data)
-
-		// and at the full path through the root storage
-		assert.Equal(t, content, mustGet(t, st, "Sub1/test.txt"))
-	})
-
-	t.Run("Ping", func(t *testing.T) {
-		st := newTestStorage(t)
-		assert.NoError(t, st.Ping(context.Background()))
-	})
-
-	// Full lifecycle: create objects across independent prefixes, read them
-	// back, overwrite (new version), partially delete, then DeleteAll one prefix
-	// and verify the other prefix is untouched — cross-checked against storage.
-	t.Run("lifecycle", func(t *testing.T) {
-		ctx := context.Background()
-		st := newTestStorage(t)
-
-		objects := map[string][]byte{
-			"books/fiction/dune.txt":        []byte("dune v1"),
-			"books/fiction/neuromancer.txt": []byte("neuromancer"),
-			"books/history/rome.txt":        []byte("rome"),
-			"users/alice/profile.txt":       []byte("alice"),
-			"users/bob/profile.txt":         []byte("bob"),
-		}
-		for k, v := range objects {
-			putObject(t, st, k, v)
-		}
-		assert.ElementsMatch(t, mapKeys(objects), rawListBlobs(t, st))
-
-		for k, v := range objects {
-			exists, err := st.Exists(ctx, k)
-			require.NoError(t, err)
-			assert.Truef(t, exists, "expected %q to exist", k)
-			assert.Equal(t, v, mustGet(t, st, k))
-		}
-
-		// new version: overwriting an existing object replaces its content in place
-		putObject(t, st, "books/fiction/dune.txt", []byte("dune v2"))
-		assert.Equal(t, []byte("dune v2"), mustGet(t, st, "books/fiction/dune.txt"))
-		assert.ElementsMatch(t, mapKeys(objects), rawListBlobs(t, st), "overwrite must not add a blob")
-
-		// partial delete: a single object goes, its sibling stays
-		require.NoError(t, st.Delete(ctx, "books/fiction/neuromancer.txt"))
-		exists, err := st.Exists(ctx, "books/fiction/neuromancer.txt")
-		require.NoError(t, err)
-		assert.False(t, exists)
-		exists, err = st.Exists(ctx, "books/fiction/dune.txt")
-		require.NoError(t, err)
-		assert.True(t, exists)
-
-		// DeleteAll on the books prefix must not touch the users prefix
-		require.NoError(t, st.DeleteAll(ctx, "books"))
-		assert.ElementsMatch(t, []string{
-			"users/alice/profile.txt",
-			"users/bob/profile.txt",
-		}, rawListBlobs(t, st))
-		assert.Equal(t, []byte("alice"), mustGet(t, st, "users/alice/profile.txt"))
-		assert.Equal(t, []byte("bob"), mustGet(t, st, "users/bob/profile.txt"))
-
-		// DeleteAll everything from the root empties the storage
-		require.NoError(t, st.DeleteAll(ctx, "/"))
-		assert.Empty(t, rawListBlobs(t, st))
-		files, dirs, err := st.ListDir(ctx)
-		require.NoError(t, err)
-		assert.Empty(t, files)
-		assert.Empty(t, dirs)
-	})
 }

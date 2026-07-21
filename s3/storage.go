@@ -326,7 +326,38 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 	return nil
 }
 
+// Delete removes the named objects. Every key is verified to exist first, so a
+// request naming one absent key deletes nothing and reports it.
+//
+// S3's DeleteObjects succeeds for keys that were never there, so absence cannot
+// be learned from the delete itself — this costs one HeadObject per key. Callers
+// deleting keys they already listed should not pay for that; DeleteAll uses the
+// unchecked deleteKnown path below for exactly that reason.
 func (s *Storage) Delete(ctx context.Context, filePaths ...string) error {
+	var missing []string
+	for _, fp := range filePaths {
+		_, err := s.service.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(s.config.Bucket),
+			Key:    aws.String(path.Join(s.prefix, fp)),
+		})
+		if err != nil {
+			if isNotFound(err) {
+				missing = append(missing, fp)
+				continue
+			}
+			return fmt.Errorf("error checking object %q: %w", fp, err)
+		}
+	}
+	if len(missing) > 0 {
+		return &storages.MissingObjectsError{Paths: missing}
+	}
+	return s.deleteKnown(ctx, filePaths...)
+}
+
+// deleteKnown removes the named objects without checking that they exist. It is
+// for callers that just enumerated the keys and would otherwise pay a HeadObject
+// per key to re-learn what they already know.
+func (s *Storage) deleteKnown(ctx context.Context, filePaths ...string) error {
 	objs := make([]types.ObjectIdentifier, len(filePaths))
 	for idx, fp := range filePaths {
 		objs[idx] = types.ObjectIdentifier{
@@ -355,12 +386,24 @@ func (s *Storage) Delete(ctx context.Context, filePaths ...string) error {
 func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
 	pathPrefix = fixPrefix(pathPrefix)
 	ss := s.SubStorage(pathPrefix, true)
-	filesList, err := storages.Walk(ctx, ss, "")
+	filesList, err := storages.Walk(ctx, ss)
 	if err != nil {
 		return fmt.Errorf("error walking through storage: %w", err)
 	}
 
-	if err = ss.Delete(ctx, filesList...); err != nil {
+	// An empty walk means no key carries this prefix, which is the only sense in
+	// which a prefix can be "missing" on an object store.
+	if len(filesList) == 0 {
+		return &storages.MissingObjectsError{Paths: []string{pathPrefix}}
+	}
+
+	// The keys came straight from the walk above, so re-checking each one would
+	// be a HeadObject per object for nothing.
+	sub, ok := ss.(*Storage)
+	if !ok {
+		return fmt.Errorf("expected *Storage from SubStorage, got %T", ss)
+	}
+	if err = sub.deleteKnown(ctx, filesList...); err != nil {
 		return fmt.Errorf("error deleting files: %w", err)
 	}
 	return nil
@@ -408,6 +451,11 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 	// always takes one, so pass a background context.
 	headObjectOutput, err := s.service.HeadObject(context.Background(), headObjectInput)
 	if err != nil {
+		// A missing object is reported via Exist rather than as an error, which
+		// is the contract every backend implements.
+		if isNotFound(err) {
+			return &storages.ObjectStat{Name: fullPath, Exist: false}, nil
+		}
 		return nil, fmt.Errorf("error getting object info: %w", err)
 	}
 

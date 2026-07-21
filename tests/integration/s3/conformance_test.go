@@ -12,17 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package inmemory
+package s3
 
 import (
+	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/greenmaskio/storages"
 	"github.com/greenmaskio/storages/storagetest"
 )
 
+// conformanceCounter keeps each conformance case on its own prefix so they stay
+// isolated within the shared bucket.
+var conformanceCounter atomic.Int64
+
+// TestConformance holds this backend to the same Storager contract as every
+// other one.
 func TestConformance(t *testing.T) {
+	root := requireMinio(t)
 	storagetest.Run(t, func(t *testing.T) storages.Storager {
-		return New("")
+		return root.SubStorage(fmt.Sprintf("conformance-%d", conformanceCounter.Add(1)), true)
 	})
 }

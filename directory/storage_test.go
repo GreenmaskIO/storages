@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/greenmaskio/storages"
-	"github.com/greenmaskio/storages/internal/storagetest"
+	"github.com/greenmaskio/storages/storagetest"
 )
 
 func TestConformance(t *testing.T) {

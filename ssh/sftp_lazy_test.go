@@ -218,9 +218,9 @@ func TestSFTPLazy_ConcurrentClient(t *testing.T) {
 	})
 
 	t.Run("established client is shared by every caller", func(t *testing.T) {
-		// Arrange: the happy path needs a real server, so use the shared container.
-		st := newTestStorage(t)
-		t.Cleanup(func() { _ = st.Close() })
+		// Arrange: the happy path needs a server that actually completes the
+		// handshake, so use the in-process one.
+		st := newLocalStorage(t)
 
 		// Act
 		clients := make([]SFTPClient, concurrency)
@@ -255,7 +255,7 @@ func TestSFTPLazy_ConcurrentClientAndClose(t *testing.T) {
 			client, err := lazy.Client(context.Background())
 			// The dial always fails against the rejecting listener, so whichever
 			// way the race lands there is no usable client — either the dial
-			// error or errStorageClosed.
+			// error or ErrStorageClosed.
 			assert.Nilf(t, client, "caller %d", i)
 			assert.Errorf(t, err, "caller %d", i)
 		})
@@ -277,7 +277,7 @@ func TestSFTPLazy_ConcurrentClientAndClose(t *testing.T) {
 
 		// Assert
 		assert.Nil(t, client)
-		assert.ErrorIs(t, err, errStorageClosed)
+		assert.ErrorIs(t, err, ErrStorageClosed)
 		assert.Zero(t, accepted.Load(), "a closed storage must not dial")
 	})
 }

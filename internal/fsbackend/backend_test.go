@@ -167,10 +167,15 @@ func TestDeleteFile(t *testing.T) {
 	})
 }
 
-func TestDeleteMissingIsNotError(t *testing.T) {
+func TestDeleteMissingIsAnError(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, mk newStorage) {
 		s, _ := mk(t)
-		assert.NoError(t, s.Delete(context.Background(), "does-not-exist.txt"))
+		err := s.Delete(context.Background(), "does-not-exist.txt")
+		assert.ErrorIs(t, err, storages.ErrFileNotFound)
+
+		var missing *storages.MissingObjectsError
+		require.ErrorAs(t, err, &missing)
+		assert.Equal(t, []string{"does-not-exist.txt"}, missing.Paths)
 	})
 }
 
@@ -181,13 +186,21 @@ func TestDeleteMultipleAndDir(t *testing.T) {
 		put(t, s, "sub/b.txt", "b")
 		put(t, s, "sub/c.txt", "c")
 
-		// A mix of an existing file, a directory, and a missing entry.
-		require.NoError(t, s.Delete(context.Background(), "a.txt", "sub", "missing.txt"))
+		// A mix of an existing file, a directory, and a missing entry. Delete
+		// verifies everything up front, so the whole call fails and even the
+		// valid "a.txt" is left alone. Both the directory and the absent entry
+		// are reported, in the order they were passed.
+		err := s.Delete(context.Background(), "a.txt", "sub", "missing.txt")
+		assert.ErrorIs(t, err, storages.ErrFileNotFound)
+
+		var missing *storages.MissingObjectsError
+		require.ErrorAs(t, err, &missing)
+		assert.Equal(t, []string{"sub", "missing.txt"}, missing.Paths)
 
 		for _, p := range []string{"a.txt", "sub/b.txt", "sub/c.txt"} {
 			ok, err := s.Exists(context.Background(), p)
 			require.NoError(t, err)
-			assert.Falsef(t, ok, "expected %s to be gone", p)
+			assert.Truef(t, ok, "expected %s to survive a failed Delete", p)
 		}
 	})
 }
@@ -210,10 +223,10 @@ func TestDeleteAll(t *testing.T) {
 	})
 }
 
-func TestDeleteAllMissingIsNotError(t *testing.T) {
+func TestDeleteAllMissingIsAnError(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, mk newStorage) {
 		s, _ := mk(t)
-		assert.NoError(t, s.DeleteAll(context.Background(), "nope"))
+		assert.ErrorIs(t, s.DeleteAll(context.Background(), "nope"), storages.ErrFileNotFound)
 	})
 }
 

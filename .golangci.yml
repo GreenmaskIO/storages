@@ -1,0 +1,33 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+      - path: ^tests/
+        linters:
+          - errcheck
+      # The s3 backend is built on aws-sdk-go-v2. Its feature/s3/manager
+      # (multipart upload helper) is marked deprecated in favor of the newer
+      # feature/s3/transfermanager, which is not yet a stable drop-in
+      # replacement; silence the SA1019 notice until we migrate to it.
+      - path: s3/
+        text: "SA1019"
+        linters:
+          - staticcheck

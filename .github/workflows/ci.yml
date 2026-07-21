@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Cross-platform validation: the filesystem-like backends (directory over
+  # afero.OsFs, inmemory over afero.MemMapFs) run the same conformance suite on
+  # every supported OS. These need no Docker, so they run on the full matrix and
+  # catch path/separator regressions on Windows.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Test (fs backends + shared code)
+        run: go test ./ ./directory/... ./inmemory/... ./internal/...
+
+  # Race detector on Linux only (no CGO toolchain assumptions on other runners).
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test with race detector
+        run: go test -race ./ ./directory/... ./inmemory/... ./internal/...
+
+  # The s3/azure/ssh unit tests spin up containers via testcontainers, so they
+  # run separately on Ubuntu where Docker is available.
+  test-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test (backends needing Docker)
+        run: go test ./s3/... ./azure/... ./ssh/...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6

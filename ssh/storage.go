@@ -26,7 +26,9 @@ import (
 	"net"
 	"os"
 	"path"
+	"slices"
 	"strconv"
+	"strings"
 
 	"golang.org/x/crypto/ssh"
 
@@ -47,13 +49,43 @@ type Storage struct {
 	sftpLazy *sftpLazy
 	cwd      string // current remote dir (root = cfg.Prefix)
 	logger   *slog.Logger
+	// unsafe records that the caller asked for the key guard to be left off. It
+	// is read once, at the end of New; nothing else consults it, because a
+	// sub-storage inherits its safety from the wrapper it was reached through
+	// rather than from a flag.
+	unsafe bool
 }
 
-// NewStorage builds an SSH/SFTP backend from cfg. The connection is established
+// Option configures a Storage.
+type Option func(*Storage)
+
+// WithLogger sets the logger for the backend's diagnostic output. Without this
+// option the backend does not log at all.
+func WithLogger(logger *slog.Logger) Option {
+	return func(s *Storage) {
+		s.logger = logger
+	}
+}
+
+// WithUnsafe turns the key guard off. By default the storage returned by
+// New is guarded: a key that reaches outside the configured prefix or
+// that names the prefix itself is refused with storages.ErrUnsafeKey before it
+// reaches the remote host. Pass this only when every key is known to be trusted
+// and a path with legitimate ".." segments has to get through.
+func WithUnsafe() Option {
+	return func(s *Storage) {
+		s.unsafe = true
+	}
+}
+
+// New builds an SSH/SFTP backend from cfg. The connection is established
 // lazily on first use (or via Ping). Pass WithLogger to enable diagnostic
 // output; without it the backend does not log at all. Call Close on the returned
 // storage when done to release the connection.
-func NewStorage(cfg Config, opts ...Option) (*Storage, error) {
+//
+// The returned storage is guarded: keys cannot escape cfg.Prefix. See WithUnsafe
+// to opt out.
+func New(cfg Config, opts ...Option) (storages.Storager, error) {
 	cfg.applyDefaults()
 	s := &Storage{
 		cfg: cfg,
@@ -83,18 +115,10 @@ func NewStorage(cfg Config, opts ...Option) (*Storage, error) {
 	address := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
 	s.sftpLazy = newSFTPLazy(address, sshConfig, s.logger)
-	return s, nil
-}
-
-// Option configures a Storage.
-type Option func(*Storage)
-
-// WithLogger sets the logger for the backend's diagnostic output. Without this
-// option the backend does not log at all.
-func WithLogger(logger *slog.Logger) Option {
-	return func(s *Storage) {
-		s.logger = logger
+	if s.unsafe {
+		return s, nil
 	}
+	return storages.Guard(s), nil
 }
 
 // buildAuthMethods assembles the SSH auth methods so the private key (if
@@ -184,6 +208,136 @@ func (s *Storage) GetObject(ctx context.Context, filePath string) (reader io.Rea
 		io.Reader
 		io.Closer
 	}{bufio.NewReaderSize(file, defaultBufferSize), file}, nil
+}
+
+// GetObjectRange reads a byte range without transferring the rest of the file:
+// SFTP reads carry an explicit offset (SSH_FXP_READ), so seeking is a protocol
+// operation rather than a client-side skip.
+func (s *Storage) GetObjectRange(
+	ctx context.Context, filePath string, offset, length int64,
+) (io.ReadCloser, error) {
+	if offset < 0 || length == 0 {
+		return nil, storages.ErrInvalidRange
+	}
+
+	client, err := s.sftpLazy.Client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	objPath := path.Join(s.cwd, filePath)
+	file, err := client.Open(objPath)
+	if err != nil {
+		// Any open failure (including a missing file) maps to not found.
+		return nil, storages.ErrFileNotFound
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		s.closeQuietly(file, objPath)
+		return nil, fmt.Errorf("get stats of object %q via SFTP: %w", objPath, err)
+	}
+	// An offset at or past the end has nothing to return, which includes every
+	// range on a zero-length file.
+	if offset >= info.Size() {
+		s.closeQuietly(file, objPath)
+		return nil, storages.ErrInvalidRange
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		s.closeQuietly(file, objPath)
+		return nil, fmt.Errorf("seek in object %q via SFTP: %w", objPath, err)
+	}
+
+	// Buffer as GetObject does, but never beyond the range asked for: a bounded
+	// range would otherwise allocate the full 64 MiB to carry a few kilobytes.
+	// io.LimitReader supplies the clamp at the end of the file for free — it
+	// simply hits EOF first.
+	var reader io.Reader = file
+	bufSize := int64(defaultBufferSize)
+	if length > 0 {
+		reader = io.LimitReader(file, length)
+		bufSize = min(bufSize, length)
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{bufio.NewReaderSize(reader, int(bufSize)), file}, nil
+}
+
+// closeQuietly closes f on an error path, where the close error is not what the
+// caller needs to hear about.
+func (s *Storage) closeQuietly(f io.Closer, objPath string) {
+	if err := f.Close(); err != nil {
+		s.logger.Warn("error closing file", "path", objPath, "error", err)
+	}
+}
+
+func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectStat, error) {
+	client, err := s.sftpLazy.Client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// A prefix naming a file lists nothing: the prefix is directory-like, and on
+	// an object store "a.txt" as a prefix means "a.txt/", which no key carries.
+	// A missing prefix is likewise empty rather than an error, which listUnder
+	// handles for the sub-directories it recurses into.
+	root := path.Join(s.cwd, prefix)
+	if info, err := client.Stat(root); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []storages.ObjectStat{}, nil
+		}
+		return nil, fmt.Errorf("get stats of %q via SFTP: %w", root, err)
+	} else if !info.IsDir() {
+		return []storages.ObjectStat{}, nil
+	}
+
+	res := []storages.ObjectStat{}
+	if err := listUnder(ctx, client, root, "", &res); err != nil {
+		return nil, err
+	}
+
+	// SFTP hands back directory entries in whatever order the server chose, and
+	// the recursion visits sub-trees as it meets them; sorting here is what makes
+	// the flat result match the key order an object store would return.
+	slices.SortFunc(res, func(a, b storages.ObjectStat) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return res, nil
+}
+
+// listUnder appends every file below dir to res, naming each one relative to the
+// listing root via the accumulated rel prefix. A missing dir contributes nothing:
+// a prefix holding nothing is an empty listing, not an error.
+func listUnder(ctx context.Context, client SFTPClient, dir, rel string, res *[]storages.ObjectStat) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	entries, err := client.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read SFTP dir %q: %w", dir, err)
+	}
+
+	for _, entry := range entries {
+		name := path.Join(rel, entry.Name())
+		if entry.IsDir() {
+			if err := listUnder(ctx, client, client.Join(dir, entry.Name()), name, res); err != nil {
+				return err
+			}
+			continue
+		}
+		*res = append(*res, storages.ObjectStat{
+			Name:         name,
+			LastModified: entry.ModTime(),
+			Exist:        true,
+			Size:         entry.Size(),
+		})
+	}
+	return nil
 }
 
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
@@ -353,7 +507,10 @@ func (s *Storage) Exists(ctx context.Context, fileName string) (bool, error) {
 	return true, nil
 }
 
-func (s *Storage) SubStorage(subPath string, relative bool) storages.Storager {
+// SubStorage re-roots the backend, which opens no connection, so the error is
+// always nil here: it exists for the storages that gate the path, such as the
+// key guard.
+func (s *Storage) SubStorage(subPath string, relative bool) (storages.Storager, error) {
 	cwd := subPath
 	if relative {
 		cwd = path.Join(s.cwd, subPath)
@@ -363,7 +520,7 @@ func (s *Storage) SubStorage(subPath string, relative bool) storages.Storager {
 		sftpLazy: s.sftpLazy,
 		cwd:      cwd,
 		logger:   s.logger,
-	}
+	}, nil
 }
 
 // Ping forces the lazy SSH/SFTP connection to be established, which serves as a
@@ -399,5 +556,6 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 		Name:         fullPath,
 		LastModified: fileInfo.ModTime(),
 		Exist:        true,
+		Size:         fileInfo.Size(),
 	}, nil
 }

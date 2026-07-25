@@ -269,7 +269,9 @@ func TestStatMissing(t *testing.T) {
 func TestSubStorageRelative(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, mk newStorage) {
 		s, cwd := mk(t)
-		sub := s.SubStorage("subdir", true).(*Storage)
+		subStorager, err := s.SubStorage("subdir", true)
+		require.NoError(t, err)
+		sub := subStorager.(*Storage)
 		assert.Equal(t, path.Join(cwd, "subdir"), sub.GetCwd())
 
 		require.NoError(t, sub.PutObject(context.Background(), "deep.txt", bytes.NewReader([]byte("deep"))))
@@ -297,7 +299,9 @@ func TestSubStorageAbsolute(t *testing.T) {
 	require.NoError(t, fs.MkdirAll("/root", DirMode))
 	s := New(fs, "/root")
 
-	sub := s.SubStorage("/elsewhere", false).(*Storage)
+	subStorager, err := s.SubStorage("/elsewhere", false)
+	require.NoError(t, err)
+	sub := subStorager.(*Storage)
 	assert.Equal(t, "/elsewhere", sub.GetCwd())
 
 	require.NoError(t, sub.PutObject(context.Background(), "x.txt", bytes.NewReader([]byte("x"))))

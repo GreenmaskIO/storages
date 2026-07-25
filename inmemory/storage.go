@@ -21,6 +21,7 @@ package inmemory
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/spf13/afero"
 
@@ -34,9 +35,29 @@ var _ storages.Storager = (*Storage)(nil)
 // Storage is the in-memory backend.
 type Storage = fsbackend.Storage
 
+// Option configures a Storage.
+type Option = fsbackend.Option
+
+// WithLogger sets the logger for the backend's diagnostic output. Without this
+// option the backend does not log at all.
+func WithLogger(logger *slog.Logger) Option {
+	return fsbackend.WithLogger(logger)
+}
+
+// WithUnsafe turns the key guard off. By default the storage returned by New is
+// guarded: a key that reaches outside basePath or that names it is refused with
+// storages.ErrUnsafeKey. Pass this only when every key is known to be trusted
+// and a path with legitimate ".." segments has to get through.
+func WithUnsafe() Option {
+	return fsbackend.WithUnsafe()
+}
+
 // New initializes a root in-memory storage rooted at basePath. An empty basePath
 // is treated as "/".
-func New(basePath string) *Storage {
+//
+// The returned storage is guarded: keys cannot escape basePath. See WithUnsafe
+// to opt out.
+func New(basePath string, opts ...Option) storages.Storager {
 	if basePath == "" {
 		basePath = "/"
 	}
@@ -47,5 +68,5 @@ func New(basePath string) *Storage {
 	if err := memFs.MkdirAll(basePath, fsbackend.DirMode); err != nil {
 		panic(fmt.Sprintf("inmemory: failed to create root %q: %v", basePath, err))
 	}
-	return fsbackend.New(memFs, basePath)
+	return fsbackend.Guarded(fsbackend.New(memFs, basePath, opts...))
 }

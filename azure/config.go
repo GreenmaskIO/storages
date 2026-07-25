@@ -55,7 +55,7 @@ type Config struct {
 
 // DefaultConfig returns a Config populated with sensible defaults. Set the
 // required fields (Container, StorageAccount) and the credentials on the result
-// before passing it to NewStorage.
+// before passing it to New.
 func DefaultConfig() Config {
 	c := Config{}
 	c.applyDefaults()
@@ -63,7 +63,7 @@ func DefaultConfig() Config {
 }
 
 // applyDefaults fills unset tuning fields with their defaults so a Config built
-// as a struct literal behaves like one from DefaultConfig. NewStorage calls
+// as a struct literal behaves like one from DefaultConfig. New calls
 // this, so Config{Container: "...", StorageAccount: "..."} is a complete config.
 func (c *Config) applyDefaults() {
 	if c.EnvironmentName == "" {

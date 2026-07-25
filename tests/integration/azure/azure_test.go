@@ -94,13 +94,15 @@ func accountEndpoint(t *testing.T) string {
 // testStorage pairs a Storage with the name of the blob container backing it,
 // which the raw SDK cross-checks need and the backend does not expose.
 type testStorage struct {
-	*azstorage.Storage
+	storages.Storager
 	container string
 }
 
 // newTestStorage returns a Storage backed by a unique, freshly created blob
-// container in the shared Azurite emulator.
-func newTestStorage(t *testing.T) *testStorage {
+// container in the shared Azurite emulator. Options are passed through to the
+// constructor, which is how the cases about the backend's own key handling
+// reach past the key guard with WithUnsafe.
+func newTestStorage(t *testing.T, opts ...azstorage.Option) *testStorage {
 	t.Helper()
 	ctx := context.Background()
 
@@ -118,9 +120,9 @@ func newTestStorage(t *testing.T) *testStorage {
 	cfg.AccessKey = azurite.AccountKey
 	cfg.Container = name
 
-	st, err := azstorage.NewStorage(ctx, cfg)
+	st, err := azstorage.New(ctx, cfg, opts...)
 	require.NoError(t, err)
-	return &testStorage{Storage: st, container: name}
+	return &testStorage{Storager: st, container: name}
 }
 
 // rawContainerClient builds an SDK container client that bypasses the storage
@@ -152,6 +154,33 @@ func mustGet(t *testing.T, st storages.Storager, key string) []byte {
 	data, err := io.ReadAll(r)
 	require.NoError(t, err)
 	return data
+}
+
+// mustGetRange reads the byte range at key and returns its bytes.
+func mustGetRange(t *testing.T, st storages.Storager, key string, offset, length int64) []byte {
+	t.Helper()
+	r, err := st.GetObjectRange(context.Background(), key, offset, length)
+	require.NoError(t, err)
+	defer func() { _ = r.Close() }()
+	data, err := io.ReadAll(r)
+	require.NoError(t, err)
+	return data
+}
+
+func objectNames(objects []storages.ObjectStat) []string {
+	names := make([]string, 0, len(objects))
+	for _, o := range objects {
+		names = append(names, o.Name)
+	}
+	return names
+}
+
+func objectSizes(objects []storages.ObjectStat) []int64 {
+	sizes := make([]int64, 0, len(objects))
+	for _, o := range objects {
+		sizes = append(sizes, o.Size)
+	}
+	return sizes
 }
 
 // rawListBlobs lists every blob in the storage's container directly through the
@@ -199,7 +228,6 @@ func TestStorage_Integration(t *testing.T) {
 			{"root file", "file.txt", []byte("hello")},
 			{"nested file", "dir/file.txt", []byte("nested")},
 			{"deeply nested", "a/b/c/d.txt", []byte("deep")},
-			{"leading slash key is trimmed", "/slash.txt", []byte("slash")},
 			{"empty content", "empty.txt", []byte{}},
 			{"binary content", "bin.dat", []byte{0x00, 0x01, 0x02, 0xff, 0xfe}},
 		}
@@ -210,6 +238,25 @@ func TestStorage_Integration(t *testing.T) {
 				assert.Equal(t, tt.content, mustGet(t, st, tt.key))
 			})
 		}
+
+		// The backend trims a leading slash off a key, so "/slash.txt" and
+		// "slash.txt" name the same blob. The key guard refuses the absolute
+		// spelling before the backend ever sees it, so the trimming is only
+		// reachable — and only observable — without the guard.
+		t.Run("leading slash", func(t *testing.T) {
+			t.Run("is refused by default", func(t *testing.T) {
+				st := newTestStorage(t)
+				err := st.PutObject(context.Background(), "/slash.txt", bytes.NewReader([]byte("slash")))
+				assert.ErrorIs(t, err, storages.ErrUnsafeKey)
+			})
+
+			t.Run("is trimmed when unguarded", func(t *testing.T) {
+				st := newTestStorage(t, azstorage.WithUnsafe())
+				putObject(t, st, "/slash.txt", []byte("slash"))
+				assert.Equal(t, []byte("slash"), mustGet(t, st, "slash.txt"))
+				assert.Equal(t, []string{"slash.txt"}, rawListBlobs(t, st))
+			})
+		})
 
 		t.Run("overwrite creates new version", func(t *testing.T) {
 			st := newTestStorage(t)
@@ -232,7 +279,9 @@ func TestStorage_Integration(t *testing.T) {
 			{"existing root", "f.txt", "f.txt", []byte("data"), nil},
 			{"existing nested", "d/f.txt", "d/f.txt", []byte("nested"), nil},
 			{"missing key", "", "missing.txt", nil, storages.ErrFileNotFound},
-			{"leading slash matches put without slash", "f.txt", "/f.txt", []byte("data"), nil},
+			// The backend would trim the leading slash and find the blob; the
+			// guard refuses the absolute spelling first.
+			{"leading slash is refused", "f.txt", "/f.txt", nil, storages.ErrUnsafeKey},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -252,6 +301,85 @@ func TestStorage_Integration(t *testing.T) {
 				assert.Equal(t, tt.wantContent, data)
 			})
 		}
+	})
+
+	// The conformance suite already runs these cases against Azurite. They are
+	// repeated here because two of them rest on assumptions about the service
+	// rather than about our code — that a range crossing the end of a blob is
+	// clamped rather than rejected, and that an unsatisfiable one comes back as
+	// bloberror.InvalidRange — and a failure should say which assumption broke.
+	t.Run("GetObjectRange", func(t *testing.T) {
+		const content = "0123456789abcdefghij"
+
+		t.Run("reads only the requested bytes", func(t *testing.T) {
+			st := newTestStorage(t)
+			putObject(t, st, "ranged.txt", []byte(content))
+			assert.Equal(t, []byte("5678"), mustGetRange(t, st, "ranged.txt", 5, 4))
+		})
+
+		t.Run("negative length reads to the end", func(t *testing.T) {
+			st := newTestStorage(t)
+			putObject(t, st, "ranged.txt", []byte(content))
+			assert.Equal(t, []byte("fghij"), mustGetRange(t, st, "ranged.txt", 15, -1))
+		})
+
+		t.Run("a range crossing the end is clamped by the service", func(t *testing.T) {
+			st := newTestStorage(t)
+			putObject(t, st, "ranged.txt", []byte(content))
+			assert.Equal(t, []byte("ghij"), mustGetRange(t, st, "ranged.txt", 16, 100))
+		})
+
+		t.Run("an offset at or past the end is InvalidRange", func(t *testing.T) {
+			st := newTestStorage(t)
+			putObject(t, st, "ranged.txt", []byte(content))
+			putObject(t, st, "empty.txt", nil)
+
+			for _, tt := range []struct {
+				name   string
+				key    string
+				offset int64
+			}{
+				{name: "at size", key: "ranged.txt", offset: int64(len(content))},
+				{name: "past size", key: "ranged.txt", offset: int64(len(content)) + 100},
+				{name: "empty blob", key: "empty.txt", offset: 0},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					_, err := st.GetObjectRange(context.Background(), tt.key, tt.offset, 1)
+					assert.ErrorIs(t, err, storages.ErrInvalidRange)
+				})
+			}
+		})
+
+		t.Run("missing blob is not found", func(t *testing.T) {
+			st := newTestStorage(t)
+			_, err := st.GetObjectRange(context.Background(), "missing.txt", 0, 4)
+			assert.ErrorIs(t, err, storages.ErrFileNotFound)
+		})
+	})
+
+	t.Run("List", func(t *testing.T) {
+		st := newTestStorage(t)
+		putObject(t, st, "a.txt", []byte("1"))
+		putObject(t, st, "data/one.txt", []byte("22"))
+		putObject(t, st, "data/sub/two.txt", []byte("333"))
+		putObject(t, st, "database/three.txt", []byte("4444"))
+
+		objects, err := st.List(context.Background(), "")
+		require.NoError(t, err)
+		assert.Equal(t,
+			[]string{"a.txt", "data/one.txt", "data/sub/two.txt", "database/three.txt"},
+			objectNames(objects),
+			"the flat pager must return the whole tree in key order")
+		assert.Equal(t, []int64{1, 2, 3, 4}, objectSizes(objects))
+
+		// The prefix is directory-like, so "data" must not reach "database".
+		nested, err := st.List(context.Background(), "data")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"one.txt", "sub/two.txt"}, objectNames(nested))
+
+		empty, err := st.List(context.Background(), "never_existed")
+		require.NoError(t, err)
+		assert.Empty(t, empty)
 	})
 
 	t.Run("Exists", func(t *testing.T) {
@@ -356,7 +484,9 @@ func TestStorage_Integration(t *testing.T) {
 
 				var target storages.Storager = st
 				if tt.listPrefix != "" {
-					target = st.SubStorage(tt.listPrefix, true)
+					var err error
+					target, err = st.SubStorage(tt.listPrefix, true)
+					require.NoError(t, err)
 				}
 
 				files, dirs, err := target.ListDir(context.Background())
@@ -418,6 +548,10 @@ func TestStorage_Integration(t *testing.T) {
 			put           []string
 			deletePrefix  string
 			wantRemaining []string
+			// unsafe builds the storage without the key guard, for the prefix
+			// that names the storage root — which the guard refuses, since
+			// emptying the whole storage is what it exists to prevent.
+			unsafe bool
 		}{
 			{
 				name:          "prefix isolation leaves other prefixes intact",
@@ -442,11 +576,16 @@ func TestStorage_Integration(t *testing.T) {
 				put:           []string{"a.txt", "d/b.txt", "d/e/c.txt"},
 				deletePrefix:  "/",
 				wantRemaining: nil,
+				unsafe:        true,
 			},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				st := newTestStorage(t)
+				var opts []azstorage.Option
+				if tt.unsafe {
+					opts = append(opts, azstorage.WithUnsafe())
+				}
+				st := newTestStorage(t, opts...)
 				for _, k := range tt.put {
 					putObject(t, st, k, []byte("x"))
 				}
@@ -461,7 +600,8 @@ func TestStorage_Integration(t *testing.T) {
 
 	t.Run("SubStorage round-trip", func(t *testing.T) {
 		st := newTestStorage(t)
-		sub := st.SubStorage("Sub1", true)
+		sub, err := st.SubStorage("Sub1", true)
+		require.NoError(t, err)
 		content := []byte("sub-storage-payload")
 		require.NoError(t, sub.PutObject(context.Background(), "test.txt", bytes.NewReader(content)))
 
@@ -531,8 +671,10 @@ func TestStorage_Integration(t *testing.T) {
 		assert.Equal(t, []byte("alice"), mustGet(t, st, "users/alice/profile.txt"))
 		assert.Equal(t, []byte("bob"), mustGet(t, st, "users/bob/profile.txt"))
 
-		// DeleteAll everything from the root empties the storage
-		require.NoError(t, st.DeleteAll(ctx, "/"))
+		// Emptying the storage means removing its remaining top-level prefix:
+		// the key guard refuses a prefix that names the root itself.
+		assert.ErrorIs(t, st.DeleteAll(ctx, "/"), storages.ErrUnsafeKey)
+		require.NoError(t, st.DeleteAll(ctx, "users"))
 		assert.Empty(t, rawListBlobs(t, st))
 		files, dirs, err := st.ListDir(ctx)
 		require.NoError(t, err)

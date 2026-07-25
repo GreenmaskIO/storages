@@ -43,10 +43,23 @@ func WithLogger(logger *slog.Logger) Option {
 	return fsbackend.WithLogger(logger)
 }
 
+// WithUnsafe turns the key guard off. By default the storage returned by
+// NewStorage is guarded: a key that reaches outside the configured directory —
+// "../../etc/passwd" — or that names the directory itself is refused with
+// storages.ErrUnsafeKey before it reaches the filesystem. Pass this only when
+// every key is known to be trusted and a path with legitimate ".." segments has
+// to get through.
+func WithUnsafe() Option {
+	return fsbackend.WithUnsafe()
+}
+
 // NewStorage opens the directory backend rooted at cfg.Path. The path must exist
 // and be a directory. Pass WithLogger to enable diagnostic output; without it the
 // backend does not log at all.
-func NewStorage(cfg Config, opts ...Option) (*Storage, error) {
+//
+// The returned storage is guarded: keys cannot escape cfg.Path. See WithUnsafe
+// to opt out.
+func NewStorage(cfg Config, opts ...Option) (storages.Storager, error) {
 	fileInfo, err := os.Stat(cfg.Path)
 	if err != nil {
 		return nil, err
@@ -54,5 +67,5 @@ func NewStorage(cfg Config, opts ...Option) (*Storage, error) {
 	if !fileInfo.IsDir() {
 		return nil, errors.New("received directory path is file")
 	}
-	return fsbackend.New(afero.NewOsFs(), cfg.Path, opts...), nil
+	return fsbackend.Guarded(fsbackend.New(afero.NewOsFs(), cfg.Path, opts...)), nil
 }

@@ -26,6 +26,8 @@ import (
 	"github.com/pkg/sftp"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/greenmaskio/storages"
 )
 
 // An in-process SSH server exposing the SFTP subsystem. The tests in this
@@ -147,8 +149,24 @@ func generateHostKey(t *testing.T) ssh.Signer {
 }
 
 // newLocalStorage returns a Storage connected to an in-process SFTP server
-// rooted at a fresh temp directory.
-func newLocalStorage(t *testing.T) *Storage {
+// rooted at a fresh temp directory, built the way a caller builds one — so the
+// key guard is in place.
+func newLocalStorage(t *testing.T) storages.Storager {
+	t.Helper()
+	return newLocalStorageWith(t)
+}
+
+// newLocalRawStorage is newLocalStorage without the key guard, for the tests
+// that reach into the backend's own fields (the shared sftpLazy) and so need the
+// concrete type rather than the wrapper.
+func newLocalRawStorage(t *testing.T) *Storage {
+	t.Helper()
+	raw, ok := newLocalStorageWith(t, WithUnsafe()).(*Storage)
+	require.True(t, ok, "WithUnsafe must yield the bare backend")
+	return raw
+}
+
+func newLocalStorageWith(t *testing.T, opts ...Option) storages.Storager {
 	t.Helper()
 
 	root := t.TempDir()
@@ -162,13 +180,13 @@ func newLocalStorage(t *testing.T) *Storage {
 		prefix = "/" + prefix
 	}
 
-	st, err := NewStorage(Config{
+	st, err := New(Config{
 		Host:     host,
 		Port:     port,
 		User:     testServerUser,
 		Password: testServerPassword,
 		Prefix:   prefix,
-	})
+	}, opts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	return st

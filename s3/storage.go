@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -28,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
@@ -50,34 +52,10 @@ const DefaultS3ObjectsDelimiter = "/"
 const deleteObjectsBatchSize = 1000
 
 const (
-	NotFountAwsErrorCode  = "NotFound"
-	NoSuchKeyAwsErrorCode = "NoSuchKey"
+	NotFountAwsErrorCode     = "NotFound"
+	NoSuchKeyAwsErrorCode    = "NoSuchKey"
+	InvalidRangeAwsErrorCode = "InvalidRange"
 )
-
-// Option configures a Storage.
-type Option func(*Storage)
-
-// WithLogger sets the logger used for diagnostic messages emitted by Storage.
-//
-// Logging is disabled when this option is omitted. Configuring a logger does
-// not by itself enable verbose AWS SDK request or response logging; use
-// WithAWSLogLevel for that.
-func WithLogger(logger *slog.Logger) Option {
-	return func(s *Storage) {
-		s.logger = logger
-	}
-}
-
-// WithAWSLogLevel controls how verbose the AWS SDK's own diagnostic logging is
-// (request, response, retry and error details) via v2's ClientLogMode bitmask
-// (e.g. aws.LogRequest | aws.LogRetries). It defaults to 0 (no SDK logging) and
-// has no effect unless a logger is also configured via WithLogger, which is the
-// destination those messages are routed to.
-func WithAWSLogLevel(level aws.ClientLogMode) Option {
-	return func(s *Storage) {
-		s.awsLogMode = level
-	}
-}
 
 // s3API is the narrow set of S3 operations Storage depends on. v2 dropped the
 // generated s3iface package, so we declare our own interface for mockability.
@@ -106,13 +84,57 @@ type Storage struct {
 	delimiter  string
 	logger     *slog.Logger
 	awsLogMode aws.ClientLogMode
+	// unsafe records that the caller asked for the key guard to be left off. It
+	// is read once, at the end of New; nothing else consults it, because a
+	// sub-storage inherits its safety from the wrapper it was reached through
+	// rather than from a flag.
+	unsafe bool
 }
 
-// NewStorage builds an S3 backend from cfg. Pass WithLogger to enable
+// Option configures a Storage.
+type Option func(*Storage)
+
+// WithLogger sets the logger used for diagnostic messages emitted by Storage.
+//
+// Logging is disabled when this option is omitted. Configuring a logger does
+// not by itself enable verbose AWS SDK request or response logging; use
+// WithAWSLogLevel for that.
+func WithLogger(logger *slog.Logger) Option {
+	return func(s *Storage) {
+		s.logger = logger
+	}
+}
+
+// WithAWSLogLevel controls how verbose the AWS SDK's own diagnostic logging is
+// (request, response, retry and error details) via v2's ClientLogMode bitmask
+// (e.g. aws.LogRequest | aws.LogRetries). It defaults to 0 (no SDK logging) and
+// has no effect unless a logger is also configured via WithLogger, which is the
+// destination those messages are routed to.
+func WithAWSLogLevel(level aws.ClientLogMode) Option {
+	return func(s *Storage) {
+		s.awsLogMode = level
+	}
+}
+
+// WithUnsafe turns the key guard off. By default the storage returned by
+// New is guarded: a key that reaches outside the configured prefix or
+// that names the prefix itself is refused with storages.ErrUnsafeKey before any
+// request is sent. Pass this only when every key is known to be trusted and a
+// path with legitimate ".." segments has to get through.
+func WithUnsafe() Option {
+	return func(s *Storage) {
+		s.unsafe = true
+	}
+}
+
+// New builds an S3 backend from cfg. Pass WithLogger to enable
 // diagnostic output; without it the backend does not log at all. Verbose AWS
 // SDK request/response logging is off by default and is controlled separately
 // via WithAWSLogLevel.
-func NewStorage(ctx context.Context, cfg Config, opts ...Option) (*Storage, error) {
+//
+// The returned storage is guarded: keys cannot escape cfg.Prefix. See WithUnsafe
+// to opt out.
+func New(ctx context.Context, cfg Config, opts ...Option) (storages.Storager, error) {
 	cfg.applyDefaults()
 	s := &Storage{config: cfg}
 	for _, opt := range opts {
@@ -215,7 +237,10 @@ func NewStorage(ctx context.Context, cfg Config, opts ...Option) (*Storage, erro
 	s.prefix = fixPrefix(cfg.Prefix)
 	s.service = client
 	s.uploader = uploader
-	return s, nil
+	if s.unsafe {
+		return s, nil
+	}
+	return storages.Guard(s), nil
 }
 
 func (s *Storage) GetCwd() string {
@@ -311,6 +336,113 @@ func (s *Storage) GetObject(ctx context.Context, filePath string) (writer io.Rea
 	return obj.Body, nil
 }
 
+func (s *Storage) GetObjectRange(
+	ctx context.Context, filePath string, offset, length int64,
+) (io.ReadCloser, error) {
+	if offset < 0 || length == 0 {
+		return nil, storages.ErrInvalidRange
+	}
+
+	obj, err := s.service.GetObject(
+		ctx, &s3.GetObjectInput{
+			Bucket: aws.String(s.config.Bucket),
+			Key:    aws.String(path.Join(s.prefix, filePath)),
+			Range:  aws.String(byteRangeHeader(offset, length)),
+		},
+	)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, storages.ErrFileNotFound
+		}
+		if isInvalidRange(err) {
+			return nil, storages.ErrInvalidRange
+		}
+		return nil, fmt.Errorf("error getting object range: %w", err)
+	}
+	return obj.Body, nil
+}
+
+// byteRangeHeader renders an HTTP Range header value. HTTP ranges are inclusive
+// on both ends, so a length of n ends at offset+n-1; a negative length becomes
+// the open-ended form, which S3 answers with everything from offset onwards.
+func byteRangeHeader(offset, length int64) string {
+	// An end past MaxInt64 would wrap; it also cannot be exceeded by any real
+	// object, so asking for "to the end" requests exactly the same bytes.
+	if length < 0 || offset > math.MaxInt64-length {
+		return fmt.Sprintf("bytes=%d-", offset)
+	}
+	return fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+}
+
+func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectStat, error) {
+	// The trailing slash is what keeps the prefix directory-like: without it
+	// "data" would also match the sibling "database".
+	fullPrefix := fixPrefix(path.Join(s.prefix, prefix))
+
+	res := []storages.ObjectStat{}
+	// S3 returns keys in lexicographic order and every key here shares fullPrefix,
+	// so trimming it preserves that order — no sorting needed.
+	collect := func(contents []types.Object) {
+		for _, object := range contents {
+			name := strings.TrimPrefix(aws.ToString(object.Key), fullPrefix)
+			if name == "" {
+				continue
+			}
+			res = append(res, storages.ObjectStat{
+				Name:         name,
+				LastModified: aws.ToTime(object.LastModified),
+				Exist:        true,
+				Size:         aws.ToInt64(object.Size),
+			})
+		}
+	}
+
+	// No delimiter: the listing is flat and recursive, which is one paginated
+	// request per page instead of one per directory level.
+	if s.config.UseListObjectsV1 {
+		// v2 ships a paginator only for ListObjectsV2, not the deprecated
+		// ListObjects operation, so page the v1 call manually via the marker.
+		page := &s3.ListObjectsInput{
+			Prefix: aws.String(fullPrefix),
+			Bucket: aws.String(s.config.Bucket),
+		}
+		for {
+			out, err := s.service.ListObjects(ctx, page)
+			if err != nil {
+				return nil, fmt.Errorf("error listing s3 objects v1: %w", err)
+			}
+			collect(out.Contents)
+			if !aws.ToBool(out.IsTruncated) {
+				break
+			}
+			// Without a delimiter S3 does not set NextMarker, so the next page
+			// starts after the last key of this one.
+			marker := aws.ToString(out.NextMarker)
+			if marker == "" && len(out.Contents) > 0 {
+				marker = aws.ToString(out.Contents[len(out.Contents)-1].Key)
+			}
+			if marker == "" {
+				break
+			}
+			page.Marker = aws.String(marker)
+		}
+		return res, nil
+	}
+
+	paginator := s3.NewListObjectsV2Paginator(s.service, &s3.ListObjectsV2Input{
+		Prefix: aws.String(fullPrefix),
+		Bucket: aws.String(s.config.Bucket),
+	})
+	for paginator.HasMorePages() {
+		out, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("error listing s3 objects v2: %w", err)
+		}
+		collect(out.Contents)
+	}
+	return res, nil
+}
+
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
 	ui := &s3.PutObjectInput{
 		Bucket:       aws.String(s.config.Bucket),
@@ -385,8 +517,8 @@ func (s *Storage) deleteKnown(ctx context.Context, filePaths ...string) error {
 
 func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
 	pathPrefix = fixPrefix(pathPrefix)
-	ss := s.SubStorage(pathPrefix, true)
-	filesList, err := storages.Walk(ctx, ss)
+	sub := s.sub(pathPrefix, true)
+	filesList, err := storages.Walk(ctx, sub)
 	if err != nil {
 		return fmt.Errorf("error walking through storage: %w", err)
 	}
@@ -399,17 +531,22 @@ func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
 
 	// The keys came straight from the walk above, so re-checking each one would
 	// be a HeadObject per object for nothing.
-	sub, ok := ss.(*Storage)
-	if !ok {
-		return fmt.Errorf("expected *Storage from SubStorage, got %T", ss)
-	}
 	if err = sub.deleteKnown(ctx, filesList...); err != nil {
 		return fmt.Errorf("error deleting files: %w", err)
 	}
 	return nil
 }
 
-func (s *Storage) SubStorage(subPath string, relative bool) storages.Storager {
+// SubStorage re-roots the backend onto another prefix, which sends no request,
+// so the error is always nil here: it exists for the storages that gate the
+// path, such as the key guard.
+func (s *Storage) SubStorage(subPath string, relative bool) (storages.Storager, error) {
+	return s.sub(subPath, relative), nil
+}
+
+// sub is SubStorage with the concrete type kept, for the internal callers that
+// need the backend's own methods.
+func (s *Storage) sub(subPath string, relative bool) *Storage {
 	prefix := subPath
 	if relative {
 		prefix = fixPrefix(path.Join(s.prefix, prefix))
@@ -463,6 +600,7 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 		Name:         fullPath,
 		LastModified: aws.ToTime(headObjectOutput.LastModified),
 		Exist:        true,
+		Size:         aws.ToInt64(headObjectOutput.ContentLength),
 	}, nil
 }
 
@@ -500,6 +638,21 @@ func isNotFound(err error) bool {
 	if errors.As(err, &apiErr) {
 		code := apiErr.ErrorCode()
 		return code == NotFountAwsErrorCode || code == NoSuchKeyAwsErrorCode
+	}
+	return false
+}
+
+// isInvalidRange reports whether err is S3's answer to an unsatisfiable byte
+// range. As with isNotFound the typed check comes first, with the HTTP status as
+// the fallback for S3-compatible endpoints that phrase the error differently.
+func isInvalidRange(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == InvalidRangeAwsErrorCode {
+		return true
+	}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable
 	}
 	return false
 }

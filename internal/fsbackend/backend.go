@@ -29,6 +29,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/spf13/afero"
 
@@ -52,6 +54,11 @@ type Storage struct {
 	dirMode  os.FileMode
 	fileMode os.FileMode
 	logger   *slog.Logger
+	// unsafe records that the caller asked for the key guard to be left off. It
+	// is read once, by Guarded, at construction time; nothing else consults it,
+	// because a sub-storage inherits its safety from the wrapper it was reached
+	// through rather than from a flag.
+	unsafe bool
 }
 
 // Option configures a Storage.
@@ -63,6 +70,27 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(s *Storage) {
 		s.logger = logger
 	}
+}
+
+// WithUnsafe turns the key guard off. By default the storage is guarded: a key
+// that reaches outside it or names its root is refused with
+// storages.ErrUnsafeKey before it reaches the filesystem. Pass this only when
+// every key is known to be trusted and a path with legitimate ".." segments has
+// to get through.
+func WithUnsafe() Option {
+	return func(s *Storage) {
+		s.unsafe = true
+	}
+}
+
+// Guarded applies the library key guard to s unless WithUnsafe was passed at
+// construction. Backends wrapping this package call it on the way out of their
+// constructor, which is the one place the unsafe flag is read.
+func Guarded(s *Storage) storages.Storager {
+	if s.unsafe {
+		return s
+	}
+	return storages.Guard(s)
 }
 
 // toSlash converts a caller-supplied path to the internal forward-slash
@@ -134,6 +162,111 @@ func (s *Storage) GetObject(_ context.Context, filePath string) (io.ReadCloser, 
 		return nil, err
 	}
 	return f, nil
+}
+
+func (s *Storage) GetObjectRange(_ context.Context, filePath string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length == 0 {
+		return nil, storages.ErrInvalidRange
+	}
+
+	f, err := s.fs.Open(native(path.Join(s.cwd, toSlash(filePath))))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, storages.ErrFileNotFound
+		}
+		return nil, err
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		s.closeQuietly(f, filePath)
+		return nil, fmt.Errorf("error getting file stat: %w", err)
+	}
+	// An offset at or past the end has nothing to return, which includes every
+	// range on a zero-length file. The object stores report this natively; here
+	// it has to be checked, since seeking past the end is legal on a filesystem
+	// and would just read zero bytes.
+	if offset >= info.Size() {
+		s.closeQuietly(f, filePath)
+		return nil, storages.ErrInvalidRange
+	}
+
+	if length < 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			s.closeQuietly(f, filePath)
+			return nil, fmt.Errorf("error seeking to offset: %w", err)
+		}
+		return f, nil
+	}
+	// SectionReader stops at the end of the file on its own, which is the clamp
+	// the contract asks for. It reads via ReadAt and so does not disturb (or
+	// need) the file's own offset.
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.NewSectionReader(f, offset, length), f}, nil
+}
+
+// closeQuietly closes f on an error path, where the close error is not what the
+// caller needs to hear about.
+func (s *Storage) closeQuietly(f afero.File, filePath string) {
+	if err := f.Close(); err != nil && s.logger != nil {
+		s.logger.Warn("error closing file", "path", filePath, "error", err)
+	}
+}
+
+func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectStat, error) {
+	root := path.Join(s.cwd, toSlash(prefix))
+
+	// A prefix that holds nothing is an empty listing, not an error, so an absent
+	// root is answered the same way an empty directory would be. A prefix naming
+	// a file is empty too: the prefix is directory-like, and on an object store
+	// "a.txt" as a prefix means "a.txt/", which no key carries.
+	info, err := s.fs.Stat(native(root))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return []storages.ObjectStat{}, nil
+		}
+		return nil, fmt.Errorf("error checking %s: %w", prefix, err)
+	}
+	if !info.IsDir() {
+		return []storages.ObjectStat{}, nil
+	}
+
+	res := []storages.ObjectStat{}
+	err = afero.Walk(s.fs, native(root), func(p string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(native(root), p)
+		if err != nil {
+			return fmt.Errorf("error relativizing %s: %w", p, err)
+		}
+		res = append(res, storages.ObjectStat{
+			Name:         toSlash(rel),
+			LastModified: info.ModTime(),
+			Exist:        true,
+			Size:         info.Size(),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error walking %s: %w", prefix, err)
+	}
+
+	// afero walks directories depth-first in name order, which orders "a/b" before
+	// "a.txt" — the reverse of how those keys sort on an object store. Sort the
+	// flat result so every backend answers in the same order.
+	slices.SortFunc(res, func(a, b storages.ObjectStat) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return res, nil
 }
 
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
@@ -243,12 +376,15 @@ func (s *Storage) Exists(_ context.Context, fileName string) (bool, error) {
 	return true, nil
 }
 
-func (s *Storage) SubStorage(subPath string, relative bool) storages.Storager {
+// SubStorage re-roots the backend, which touches no filesystem, so the error is
+// always nil here: it exists for the storages that gate the path, such as the
+// key guard.
+func (s *Storage) SubStorage(subPath string, relative bool) (storages.Storager, error) {
 	newCwd := toSlash(subPath)
 	if relative {
 		newCwd = path.Join(s.cwd, toSlash(subPath))
 	}
-	return s.sub(newCwd)
+	return s.sub(newCwd), nil
 }
 
 func (s *Storage) sub(cwd string) *Storage {
@@ -274,6 +410,7 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 		Name:         fullPath,
 		LastModified: info.ModTime(),
 		Exist:        true,
+		Size:         info.Size(),
 	}, nil
 }
 

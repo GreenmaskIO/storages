@@ -268,12 +268,38 @@ func TestNewStorage_AuthDispatch(t *testing.T) {
 			cfg.Endpoint = "http://127.0.0.1:10000/devstoreaccount1"
 			tt.configure(&cfg)
 
-			st, err := NewStorage(context.Background(), cfg)
+			// WithUnsafe yields the bare backend, whose container client is what
+			// this test is about; the guard wrapper does not expose it.
+			st, err := New(context.Background(), cfg, WithUnsafe())
 			require.NoError(t, err)
 			require.NotNil(t, st)
-			assert.NotNil(t, st.containerClient)
+			raw, ok := st.(*Storage)
+			require.True(t, ok, "WithUnsafe must yield the bare backend")
+			assert.NotNil(t, raw.containerClient)
 		})
 	}
+}
+
+// The guard itself is tested once, in the root package, over a backend-agnostic
+// decorator. What this backend has to pin is only that its constructor applies
+// it — that a caller who does nothing special gets a storage no key can climb
+// out of. No request is made: the key is refused before the SDK is reached.
+func TestNewStorage_GuardsKeysByDefault(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := DefaultConfig()
+	cfg.StorageAccount = devAccountName
+	cfg.Container = "cont"
+	cfg.AccessKey = devAccountKey
+	cfg.Endpoint = "http://127.0.0.1:1" // never dialled
+	cfg.Prefix = "dumps"
+
+	st, err := New(ctx, cfg)
+	require.NoError(t, err)
+
+	_, err = st.GetObject(ctx, "../../escape.txt")
+	assert.ErrorIs(t, err, storages.ErrUnsafeKey)
+	assert.ErrorIs(t, st.DeleteAll(ctx, ""), storages.ErrUnsafeKey)
 }
 
 func Test_fixPrefix(t *testing.T) {
@@ -370,7 +396,8 @@ func TestStorage_SubStorage(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			st := &Storage{prefix: tt.base}
-			sub := st.SubStorage(tt.sub, tt.relative)
+			sub, err := st.SubStorage(tt.sub, tt.relative)
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantCwd, sub.GetCwd())
 		})
 	}
@@ -477,9 +504,10 @@ func (m *mockContainer) Create(
 }
 
 func (m *mockContainer) NewListBlobsFlatPager(
-	_ *container.ListBlobsFlatOptions,
+	o *container.ListBlobsFlatOptions,
 ) *runtime.Pager[container.ListBlobsFlatResponse] {
-	panic("NewListBlobsFlatPager is not used in mock tests")
+	args := m.Called(o)
+	return args.Get(0).(*runtime.Pager[container.ListBlobsFlatResponse])
 }
 
 // atPrefix matches a hierarchy-pager options argument by its Prefix.
@@ -517,6 +545,62 @@ func newFakeHierarchyPager(pages ...container.ListBlobsHierarchyResponse) *runti
 	})
 }
 
+// atFlatPrefix matches a flat-pager options argument by its Prefix.
+func atFlatPrefix(prefix string) any {
+	return mock.MatchedBy(func(o *container.ListBlobsFlatOptions) bool {
+		return o != nil && o.Prefix != nil && *o.Prefix == prefix
+	})
+}
+
+// flatBlob describes one entry of a flat listing.
+type flatBlob struct {
+	name string
+	size int64
+}
+
+// flatPage builds one page of a flat listing.
+func flatPage(blobs ...flatBlob) container.ListBlobsFlatResponse {
+	seg := &container.BlobFlatListSegment{}
+	for _, b := range blobs {
+		seg.BlobItems = append(seg.BlobItems, &container.BlobItem{
+			Name: to.Ptr(b.name),
+			Properties: &container.BlobProperties{
+				ContentLength: to.Ptr(b.size),
+				LastModified:  to.Ptr(flatListModTime),
+			},
+		})
+	}
+	return container.ListBlobsFlatResponse{
+		ListBlobsFlatSegmentResponse: container.ListBlobsFlatSegmentResponse{Segment: seg},
+	}
+}
+
+// flatListModTime is the LastModified every flatPage entry carries.
+var flatListModTime = time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+
+// newFakeFlatPager returns a pager that yields the given pages in order.
+func newFakeFlatPager(pages ...container.ListBlobsFlatResponse) *runtime.Pager[container.ListBlobsFlatResponse] {
+	idx := 0
+	return runtime.NewPager(runtime.PagingHandler[container.ListBlobsFlatResponse]{
+		More: func(container.ListBlobsFlatResponse) bool { return idx < len(pages) },
+		Fetcher: func(context.Context, *container.ListBlobsFlatResponse) (container.ListBlobsFlatResponse, error) {
+			p := pages[idx]
+			idx++
+			return p, nil
+		},
+	})
+}
+
+// newErrorFlatPager returns a flat pager whose first fetch fails.
+func newErrorFlatPager(err error) *runtime.Pager[container.ListBlobsFlatResponse] {
+	return runtime.NewPager(runtime.PagingHandler[container.ListBlobsFlatResponse]{
+		More: func(container.ListBlobsFlatResponse) bool { return true },
+		Fetcher: func(context.Context, *container.ListBlobsFlatResponse) (container.ListBlobsFlatResponse, error) {
+			return container.ListBlobsFlatResponse{}, err
+		},
+	})
+}
+
 // newErrorHierarchyPager returns a pager whose first fetch fails.
 func newErrorHierarchyPager(err error) *runtime.Pager[container.ListBlobsHierarchyResponse] {
 	return runtime.NewPager(runtime.PagingHandler[container.ListBlobsHierarchyResponse]{
@@ -530,6 +614,12 @@ func newErrorHierarchyPager(err error) *runtime.Pager[container.ListBlobsHierarc
 // blobNotFound builds an error that bloberror.HasCode recognizes as BlobNotFound.
 func blobNotFound() error {
 	return &azcore.ResponseError{ErrorCode: string(bloberror.BlobNotFound)}
+}
+
+// invalidRange builds an error that bloberror.HasCode recognizes as InvalidRange,
+// which is how Azure answers a range it cannot satisfy.
+func invalidRange() error {
+	return &azcore.ResponseError{ErrorCode: string(bloberror.InvalidRange)}
 }
 
 func newMockStorage(t *testing.T, prefix string, c containerAPI) *Storage {
@@ -644,6 +734,214 @@ func TestStorage_GetObject(t *testing.T) {
 	}
 }
 
+func TestStorage_GetObjectRange(t *testing.T) {
+	// downloadRanges returns the HTTPRange of every DownloadStream call, in order.
+	downloadRanges := func(bb *mockBlockBlob) []blob.HTTPRange {
+		var ranges []blob.HTTPRange
+		for _, c := range bb.Calls {
+			if c.Method != "DownloadStream" {
+				continue
+			}
+			o, _ := c.Arguments.Get(1).(*blob.DownloadStreamOptions)
+			require.NotNil(t, o, "DownloadStream must be given range options")
+			ranges = append(ranges, o.Range)
+		}
+		return ranges
+	}
+
+	tests := []struct {
+		name        string
+		offset      int64
+		length      int64
+		downloadErr error
+		wantRange   blob.HTTPRange
+		wantErrIs   error
+		wantErrText string
+	}{
+		{name: "bounded range", offset: 5, length: 4, wantRange: blob.HTTPRange{Offset: 5, Count: 4}},
+		// Azure spells "to the end" as Count 0 (blob.CountToEnd).
+		{name: "negative length reads to the end", offset: 15, length: -1, wantRange: blob.HTTPRange{Offset: 15, Count: blob.CountToEnd}},
+		{name: "InvalidRange maps to ErrInvalidRange", offset: 0, length: 4, downloadErr: invalidRange(), wantRange: blob.HTTPRange{Offset: 0, Count: 4}, wantErrIs: storages.ErrInvalidRange},
+		{name: "BlobNotFound maps to ErrFileNotFound", offset: 0, length: 4, downloadErr: blobNotFound(), wantRange: blob.HTTPRange{Offset: 0, Count: 4}, wantErrIs: storages.ErrFileNotFound},
+		{name: "other error wrapped", offset: 0, length: 4, downloadErr: errors.New("network"), wantRange: blob.HTTPRange{Offset: 0, Count: 4}, wantErrText: "error getting object range"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			bb := &mockBlockBlob{}
+			if tt.downloadErr != nil {
+				bb.On("DownloadStream", mock.Anything, mock.Anything).
+					Return(blob.DownloadStreamResponse{}, tt.downloadErr)
+			} else {
+				bb.On("DownloadStream", mock.Anything, mock.Anything).Return(blob.DownloadStreamResponse{
+					DownloadResponse: blob.DownloadResponse{Body: io.NopCloser(strings.NewReader("chunk"))},
+				}, nil)
+			}
+			c := &mockContainer{}
+			c.On("NewBlockBlobClient", mock.Anything).Return(bb)
+			st := newMockStorage(t, "dumps/", c)
+
+			// Act
+			reader, err := st.GetObjectRange(context.Background(), "a.txt", tt.offset, tt.length)
+
+			// Assert
+			assert.Equal(t, []string{"dumps/a.txt"}, c.blobNames)
+			assert.Equal(t, []blob.HTTPRange{tt.wantRange}, downloadRanges(bb),
+				"the server must be asked for exactly the requested bytes")
+			switch {
+			case tt.wantErrIs != nil:
+				assert.ErrorIs(t, err, tt.wantErrIs)
+				assert.Nil(t, reader)
+			case tt.wantErrText != "":
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrText)
+				assert.Nil(t, reader)
+			default:
+				require.NoError(t, err)
+				defer reader.Close()
+				got, err := io.ReadAll(reader)
+				require.NoError(t, err)
+				assert.Equal(t, "chunk", string(got))
+			}
+		})
+	}
+}
+
+// Azure answers an offset sitting exactly at the end of a blob with an empty
+// 200 rather than InvalidRange, so the backend has to recognize that shape
+// itself — otherwise the caller would see a silently empty read where every
+// other backend reports ErrInvalidRange.
+func TestStorage_GetObjectRange_EmptyResponseIsInvalidRange(t *testing.T) {
+	// Arrange
+	body := &closeTrackingReader{Reader: strings.NewReader("")}
+	bb := &mockBlockBlob{}
+	bb.On("DownloadStream", mock.Anything, mock.Anything).Return(blob.DownloadStreamResponse{
+		DownloadResponse: blob.DownloadResponse{Body: body, ContentLength: to.Ptr(int64(0))},
+	}, nil)
+	c := &mockContainer{}
+	c.On("NewBlockBlobClient", mock.Anything).Return(bb)
+	st := newMockStorage(t, "dumps/", c)
+
+	// Act
+	reader, err := st.GetObjectRange(context.Background(), "a.txt", 20, 4)
+
+	// Assert
+	assert.ErrorIs(t, err, storages.ErrInvalidRange)
+	assert.Nil(t, reader)
+	assert.True(t, body.closed, "the response body must not be leaked when the range is rejected")
+}
+
+// closeTrackingReader records whether it was closed.
+type closeTrackingReader struct {
+	io.Reader
+	closed bool
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.closed = true
+	return nil
+}
+
+// A range that cannot yield anything is a caller bug the backend rejects on the
+// spot; no request is worth sending.
+func TestStorage_GetObjectRange_RejectsImpossibleRangeWithoutCallingAzure(t *testing.T) {
+	tests := []struct {
+		name           string
+		offset, length int64
+	}{
+		{name: "zero length", offset: 0, length: 0},
+		{name: "negative offset", offset: -1, length: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			c := &mockContainer{}
+			st := newMockStorage(t, "dumps/", c)
+
+			// Act
+			reader, err := st.GetObjectRange(context.Background(), "a.txt", tt.offset, tt.length)
+
+			// Assert
+			assert.ErrorIs(t, err, storages.ErrInvalidRange)
+			assert.Nil(t, reader)
+			assert.Empty(t, c.Calls, "an impossible range must not reach Azure")
+		})
+	}
+}
+
+func TestStorage_List(t *testing.T) {
+	t.Run("paginates, strips prefix, carries sizes", func(t *testing.T) {
+		// Arrange
+		c := &mockContainer{}
+		c.On("NewListBlobsFlatPager", atFlatPrefix("p/")).Return(newFakeFlatPager(
+			flatPage(flatBlob{name: "p/a.txt", size: 1}),
+			flatPage(flatBlob{name: "p/dir/b.txt", size: 22}),
+		))
+		st := newMockStorage(t, "p/", c)
+
+		// Act
+		objects, err := st.List(context.Background(), "")
+
+		// Assert
+		require.NoError(t, err)
+		require.Len(t, objects, 2)
+		assert.Equal(t, "a.txt", objects[0].Name)
+		assert.Equal(t, int64(1), objects[0].Size)
+		assert.True(t, objects[0].Exist)
+		assert.True(t, objects[0].LastModified.Equal(flatListModTime))
+		assert.Equal(t, "dir/b.txt", objects[1].Name)
+		assert.Equal(t, int64(22), objects[1].Size)
+		c.AssertExpectations(t)
+	})
+
+	// The trailing slash is what stops "data" from also matching "database".
+	t.Run("prefix is directory-like", func(t *testing.T) {
+		// Arrange
+		c := &mockContainer{}
+		c.On("NewListBlobsFlatPager", atFlatPrefix("p/data/")).
+			Return(newFakeFlatPager(flatPage(flatBlob{name: "p/data/one.txt", size: 1})))
+		st := newMockStorage(t, "p/", c)
+
+		// Act
+		objects, err := st.List(context.Background(), "data")
+
+		// Assert
+		require.NoError(t, err)
+		require.Len(t, objects, 1)
+		assert.Equal(t, "one.txt", objects[0].Name)
+		c.AssertExpectations(t)
+	})
+
+	t.Run("a prefix holding nothing is an empty listing, not an error", func(t *testing.T) {
+		// Arrange
+		c := &mockContainer{}
+		c.On("NewListBlobsFlatPager", mock.Anything).Return(newFakeFlatPager(flatPage()))
+		st := newMockStorage(t, "p/", c)
+
+		// Act
+		objects, err := st.List(context.Background(), "never_existed")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Empty(t, objects)
+	})
+
+	t.Run("error is wrapped", func(t *testing.T) {
+		// Arrange
+		c := &mockContainer{}
+		c.On("NewListBlobsFlatPager", mock.Anything).Return(newErrorFlatPager(errors.New("boom")))
+		st := newMockStorage(t, "p/", c)
+
+		// Act
+		_, err := st.List(context.Background(), "")
+
+		// Assert
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "error listing azure blobs")
+	})
+}
+
 func TestStorage_Exists(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -711,7 +1009,7 @@ func TestStorage_Stat(t *testing.T) {
 					Return(blob.GetPropertiesResponse{}, tt.getErr)
 			} else {
 				bb.On("GetProperties", mock.Anything, mock.Anything).
-					Return(blob.GetPropertiesResponse{LastModified: to.Ptr(modTime)}, nil)
+					Return(blob.GetPropertiesResponse{LastModified: to.Ptr(modTime), ContentLength: to.Ptr(int64(42))}, nil)
 			}
 			c := &mockContainer{}
 			c.On("NewBlockBlobClient", mock.Anything).Return(bb)
@@ -737,6 +1035,7 @@ func TestStorage_Stat(t *testing.T) {
 			}
 			assert.True(t, stat.Exist)
 			assert.True(t, stat.LastModified.Equal(modTime), "LastModified = %v", stat.LastModified)
+			assert.Equal(t, int64(42), stat.Size, "Size must come from the blob's Content-Length")
 		})
 	}
 }

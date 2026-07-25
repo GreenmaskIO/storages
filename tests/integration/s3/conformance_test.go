@@ -32,6 +32,10 @@ var conformanceCounter atomic.Int64
 func TestConformance(t *testing.T) {
 	root := requireMinio(t)
 	storagetest.Run(t, func(t *testing.T) storages.Storager {
-		return root.SubStorage(fmt.Sprintf("conformance-%d", conformanceCounter.Add(1)), true)
+		sub, err := root.SubStorage(fmt.Sprintf("conformance-%d", conformanceCounter.Add(1)), true)
+		if err != nil {
+			t.Fatalf("SubStorage: %v", err)
+		}
+		return sub
 	})
 }

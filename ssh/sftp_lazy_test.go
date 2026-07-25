@@ -109,16 +109,20 @@ func newRejectingStorage(t *testing.T, addr string) *Storage {
 	port, err := net.LookupPort("tcp", portStr)
 	require.NoError(t, err)
 
-	st, err := NewStorage(Config{
+	// WithUnsafe yields the bare backend: these tests assert on its own fields
+	// (the shared sftpLazy), which the guard wrapper does not expose.
+	st, err := New(Config{
 		Host:     host,
 		Port:     port,
 		User:     "irrelevant",
 		Password: "irrelevant",
 		Prefix:   "/upload",
-	})
+	}, WithUnsafe())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	return st
+	raw, ok := st.(*Storage)
+	require.True(t, ok, "WithUnsafe must yield the bare backend")
+	return raw
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -148,7 +152,9 @@ func TestSFTPLazy_ConcurrentUseDialsOnce(t *testing.T) {
 			handles: func(t *testing.T, parent *Storage) []*Storage {
 				handles := make([]*Storage, concurrency)
 				for i := range handles {
-					sub, ok := parent.SubStorage("sub", true).(*Storage)
+					subStorager, err := parent.SubStorage("sub", true)
+					require.NoError(t, err)
+					sub, ok := subStorager.(*Storage)
 					require.True(t, ok)
 					handles[i] = sub
 				}
@@ -161,7 +167,9 @@ func TestSFTPLazy_ConcurrentUseDialsOnce(t *testing.T) {
 				handles := make([]*Storage, concurrency)
 				current := parent
 				for i := range handles {
-					sub, ok := current.SubStorage("nested", true).(*Storage)
+					subStorager, err := current.SubStorage("nested", true)
+					require.NoError(t, err)
+					sub, ok := subStorager.(*Storage)
 					require.True(t, ok)
 					handles[i] = sub
 					current = sub
@@ -220,7 +228,7 @@ func TestSFTPLazy_ConcurrentClient(t *testing.T) {
 	t.Run("established client is shared by every caller", func(t *testing.T) {
 		// Arrange: the happy path needs a server that actually completes the
 		// handshake, so use the in-process one.
-		st := newLocalStorage(t)
+		st := newLocalRawStorage(t)
 
 		// Act
 		clients := make([]SFTPClient, concurrency)

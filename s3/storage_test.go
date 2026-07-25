@@ -25,15 +25,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -178,7 +182,7 @@ func (m *mockUploader) lastPut() *s3.PutObjectInput {
 }
 
 // newStorage builds a Storage wired to the supplied doubles, bypassing
-// NewStorage (which needs AWS config/network). Either double may be nil for
+// New (which needs AWS config/network). Either double may be nil for
 // tests that never reach it.
 func newStorage(t *testing.T, prefix string, svc s3API, up uploaderAPI) *Storage {
 	t.Helper()
@@ -205,6 +209,18 @@ func makeFilePaths(n int) []string {
 // typed error.
 func apiErr(code string) error {
 	return &smithy.GenericAPIError{Code: code, Message: "boom"}
+}
+
+// statusErr builds the transport-level error the SDK surfaces for a response
+// whose body carried no recognizable API error code — the shape an
+// S3-compatible endpoint can produce for a 416.
+func statusErr(status int) error {
+	return &awshttp.ResponseError{
+		ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+			Err:      errors.New("boom"),
+		},
+	}
 }
 
 // ===========================================================================
@@ -254,6 +270,32 @@ func Test_isNotFound(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Act
 			got := isNotFound(tt.err)
+
+			// Assert
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_isInvalidRange(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "apierr InvalidRange code", err: apiErr(InvalidRangeAwsErrorCode), want: true},
+		{name: "wrapped apierr InvalidRange code", err: fmt.Errorf("wrap: %w", apiErr(InvalidRangeAwsErrorCode)), want: true},
+		{name: "apierr unrelated code", err: apiErr("AccessDenied"), want: false},
+		{name: "416 without a recognizable code", err: statusErr(http.StatusRequestedRangeNotSatisfiable), want: true},
+		{name: "other status", err: statusErr(http.StatusForbidden), want: false},
+		{name: "plain error", err: errors.New("nope"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Act
+			got := isInvalidRange(tt.err)
 
 			// Assert
 			assert.Equal(t, tt.want, got)
@@ -328,9 +370,10 @@ func TestStorage_SubStorage(t *testing.T) {
 			st := newStorage(t, tt.prefix, svc, up)
 
 			// Act
-			sub := st.SubStorage(tt.subPath, tt.relative)
+			sub, err := st.SubStorage(tt.subPath, tt.relative)
 
 			// Assert
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantCwd, sub.GetCwd())
 			subImpl, ok := sub.(*Storage)
 			require.True(t, ok)
@@ -445,6 +488,235 @@ func TestStorage_GetObject(t *testing.T) {
 	}
 }
 
+func TestStorage_GetObjectRange(t *testing.T) {
+	// ranges returns the Range header of every GetObject call, in order.
+	ranges := func(m *mockS3) []string {
+		return m.capturedKeys("GetObject", func(a mock.Arguments) string {
+			return aws.ToString(a.Get(1).(*s3.GetObjectInput).Range)
+		})
+	}
+
+	tests := []struct {
+		name        string
+		offset      int64
+		length      int64
+		getErr      error
+		wantRange   string
+		wantErrIs   error
+		wantErrText string
+	}{
+		// HTTP ranges are inclusive on both ends, so a 4-byte range from 5 ends at 8.
+		{name: "bounded range is inclusive", offset: 5, length: 4, wantRange: "bytes=5-8"},
+		{name: "single byte", offset: 0, length: 1, wantRange: "bytes=0-0"},
+		{name: "negative length is open ended", offset: 15, length: -1, wantRange: "bytes=15-"},
+		// An end past MaxInt64 would wrap; no object can reach it, so ask for the rest.
+		{name: "overflowing end degrades to open ended", offset: 10, length: math.MaxInt64, wantRange: "bytes=10-"},
+		{name: "InvalidRange code maps to ErrInvalidRange", offset: 0, length: 4, getErr: apiErr(InvalidRangeAwsErrorCode), wantRange: "bytes=0-3", wantErrIs: storages.ErrInvalidRange},
+		{name: "416 status maps to ErrInvalidRange", offset: 0, length: 4, getErr: statusErr(http.StatusRequestedRangeNotSatisfiable), wantRange: "bytes=0-3", wantErrIs: storages.ErrInvalidRange},
+		{name: "NoSuchKey maps to ErrFileNotFound", offset: 0, length: 4, getErr: &types.NoSuchKey{}, wantRange: "bytes=0-3", wantErrIs: storages.ErrFileNotFound},
+		{name: "other error wrapped", offset: 0, length: 4, getErr: errors.New("network down"), wantRange: "bytes=0-3", wantErrText: "error getting object range"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			svc := &mockS3{}
+			if tt.getErr != nil {
+				svc.On("GetObject", mock.Anything, mock.Anything).Return(nil, tt.getErr)
+			} else {
+				svc.On("GetObject", mock.Anything, mock.Anything).
+					Return(&s3.GetObjectOutput{Body: io.NopCloser(strings.NewReader("chunk"))}, nil)
+			}
+			st := newStorage(t, "dumps/", svc, nil)
+
+			// Act
+			reader, err := st.GetObjectRange(context.Background(), "a.txt", tt.offset, tt.length)
+
+			// Assert
+			require.Equal(t, []string{"dumps/a.txt"}, svc.getKeys())
+			require.Equal(t, []string{tt.wantRange}, ranges(svc), "the server must be asked for exactly the requested bytes")
+			switch {
+			case tt.wantErrIs != nil:
+				assert.ErrorIs(t, err, tt.wantErrIs)
+				assert.Nil(t, reader)
+			case tt.wantErrText != "":
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrText)
+				assert.Nil(t, reader)
+			default:
+				require.NoError(t, err)
+				defer reader.Close()
+				got, err := io.ReadAll(reader)
+				require.NoError(t, err)
+				assert.Equal(t, "chunk", string(got))
+			}
+			svc.AssertExpectations(t)
+		})
+	}
+}
+
+// A range that cannot yield anything is a caller bug the backend rejects on the
+// spot; no request is worth sending.
+func TestStorage_GetObjectRange_RejectsImpossibleRangeWithoutCallingS3(t *testing.T) {
+	tests := []struct {
+		name           string
+		offset, length int64
+	}{
+		{name: "zero length", offset: 0, length: 0},
+		{name: "negative offset", offset: -1, length: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			svc := &mockS3{}
+			st := newStorage(t, "dumps/", svc, nil)
+
+			// Act
+			reader, err := st.GetObjectRange(context.Background(), "a.txt", tt.offset, tt.length)
+
+			// Assert
+			assert.ErrorIs(t, err, storages.ErrInvalidRange)
+			assert.Nil(t, reader)
+			assert.Empty(t, svc.Calls, "an impossible range must not reach S3")
+		})
+	}
+}
+
+func TestStorage_List(t *testing.T) {
+	modTime := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	noToken := mock.MatchedBy(func(in *s3.ListObjectsV2Input) bool { return in.ContinuationToken == nil })
+	withToken := mock.MatchedBy(func(in *s3.ListObjectsV2Input) bool { return in.ContinuationToken != nil })
+	// A flat listing must not pass a delimiter: the request covers the whole
+	// sub-tree, not one directory level.
+	flatAtPrefix := func(prefix string) any {
+		return mock.MatchedBy(func(in *s3.ListObjectsV2Input) bool {
+			return aws.ToString(in.Prefix) == prefix && in.Delimiter == nil
+		})
+	}
+
+	t.Run("v2 paginates, strips prefix, carries sizes", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("ListObjectsV2", mock.Anything, noToken).Return(&s3.ListObjectsV2Output{
+			Contents: []types.Object{
+				{Key: aws.String("p/a.txt"), Size: aws.Int64(1), LastModified: aws.Time(modTime)},
+			},
+			IsTruncated:           aws.Bool(true),
+			NextContinuationToken: aws.String("token-1"),
+		}, nil)
+		svc.On("ListObjectsV2", mock.Anything, withToken).Return(&s3.ListObjectsV2Output{
+			Contents: []types.Object{
+				{Key: aws.String("p/dir/b.txt"), Size: aws.Int64(22), LastModified: aws.Time(modTime)},
+			},
+			IsTruncated: aws.Bool(false),
+		}, nil)
+		st := newStorage(t, "p/", svc, nil)
+
+		// Act
+		objects, err := st.List(context.Background(), "")
+
+		// Assert
+		require.NoError(t, err)
+		require.Len(t, objects, 2)
+		assert.Equal(t, "a.txt", objects[0].Name)
+		assert.Equal(t, int64(1), objects[0].Size)
+		assert.True(t, objects[0].Exist)
+		assert.True(t, objects[0].LastModified.Equal(modTime))
+		assert.Equal(t, "dir/b.txt", objects[1].Name)
+		assert.Equal(t, int64(22), objects[1].Size)
+	})
+
+	// The trailing slash is what stops "data" from also matching "database".
+	t.Run("v2 prefix is directory-like", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("ListObjectsV2", mock.Anything, flatAtPrefix("p/data/")).Return(&s3.ListObjectsV2Output{
+			Contents: []types.Object{{Key: aws.String("p/data/one.txt"), Size: aws.Int64(1)}},
+		}, nil)
+		st := newStorage(t, "p/", svc, nil)
+
+		// Act
+		objects, err := st.List(context.Background(), "data")
+
+		// Assert
+		require.NoError(t, err)
+		require.Len(t, objects, 1)
+		assert.Equal(t, "one.txt", objects[0].Name)
+		svc.AssertExpectations(t)
+	})
+
+	t.Run("empty prefix on a root storage lists the whole bucket", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("ListObjectsV2", mock.Anything, flatAtPrefix("")).Return(&s3.ListObjectsV2Output{}, nil)
+		st := newStorage(t, "", svc, nil)
+
+		// Act
+		objects, err := st.List(context.Background(), "")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Empty(t, objects)
+		svc.AssertExpectations(t)
+	})
+
+	t.Run("v1 pages by marker", func(t *testing.T) {
+		// Arrange
+		noMarker := mock.MatchedBy(func(in *s3.ListObjectsInput) bool { return in.Marker == nil })
+		withMarker := mock.MatchedBy(func(in *s3.ListObjectsInput) bool { return in.Marker != nil })
+		svc := &mockS3{}
+		svc.On("ListObjects", mock.Anything, noMarker).Return(&s3.ListObjectsOutput{
+			Contents:    []types.Object{{Key: aws.String("p/a.txt"), Size: aws.Int64(1)}},
+			IsTruncated: aws.Bool(true),
+			// Without a delimiter S3 sets no NextMarker -> page from the last key.
+		}, nil)
+		svc.On("ListObjects", mock.Anything, withMarker).Return(&s3.ListObjectsOutput{
+			Contents:    []types.Object{{Key: aws.String("p/b.txt"), Size: aws.Int64(2)}},
+			IsTruncated: aws.Bool(false),
+		}, nil)
+		st := newStorage(t, "p/", svc, nil)
+		st.config.UseListObjectsV1 = true
+
+		// Act
+		objects, err := st.List(context.Background(), "")
+
+		// Assert
+		require.NoError(t, err)
+		require.Len(t, objects, 2)
+		assert.Equal(t, []string{"a.txt", "b.txt"}, []string{objects[0].Name, objects[1].Name})
+		assert.Equal(t, []string{"", "p/a.txt"}, svc.listMarkers(), "second page must start after the last key")
+	})
+
+	t.Run("a prefix holding nothing is an empty listing, not an error", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("ListObjectsV2", mock.Anything, mock.Anything).Return(&s3.ListObjectsV2Output{}, nil)
+		st := newStorage(t, "p/", svc, nil)
+
+		// Act
+		objects, err := st.List(context.Background(), "never_existed")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Empty(t, objects)
+	})
+
+	t.Run("v2 error is wrapped", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("ListObjectsV2", mock.Anything, mock.Anything).Return(nil, errors.New("boom"))
+		st := newStorage(t, "p/", svc, nil)
+
+		// Act
+		_, err := st.List(context.Background(), "")
+
+		// Assert
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "error listing s3 objects v2")
+	})
+}
+
 func TestStorage_Exists(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -519,7 +791,7 @@ func TestStorage_Stat(t *testing.T) {
 				svc.On("HeadObject", mock.Anything, mock.Anything).Return(nil, tt.headErr)
 			} else {
 				svc.On("HeadObject", mock.Anything, mock.Anything).
-					Return(&s3.HeadObjectOutput{LastModified: aws.Time(modTime)}, nil)
+					Return(&s3.HeadObjectOutput{LastModified: aws.Time(modTime), ContentLength: aws.Int64(42)}, nil)
 			}
 			st := newStorage(t, tt.prefix, svc, nil)
 
@@ -545,6 +817,7 @@ func TestStorage_Stat(t *testing.T) {
 			assert.Equal(t, tt.wantName, stat.Name)
 			assert.True(t, stat.Exist)
 			assert.True(t, stat.LastModified.Equal(modTime), "LastModified = %v", stat.LastModified)
+			assert.Equal(t, int64(42), stat.Size, "Size must come from the HeadObject Content-Length")
 			svc.AssertExpectations(t)
 		})
 	}
@@ -880,4 +1153,33 @@ func TestStorage_DeleteAll(t *testing.T) {
 		batches[0],
 		"every walked key must be deleted with the sub-storage prefix re-applied",
 	)
+}
+
+// The guard itself is tested once, in the root package, over a backend-agnostic
+// decorator. What this backend has to pin is only that its constructor applies
+// it — that a caller who does nothing special gets a storage no key can climb
+// out of. No request is made: the key is refused before the SDK is reached.
+func TestNewStorage_GuardsKeysByDefault(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := DefaultConfig()
+	cfg.Bucket = "test-bucket"
+	cfg.Region = "us-east-1"
+	cfg.Prefix = "dumps"
+	cfg.Endpoint = "http://127.0.0.1:1" // never dialled
+	cfg.AccessKeyId = "id"
+	cfg.SecretAccessKey = "secret"
+
+	st, err := New(ctx, cfg)
+	require.NoError(t, err)
+
+	_, err = st.GetObject(ctx, "../../escape.txt")
+	assert.ErrorIs(t, err, storages.ErrUnsafeKey)
+	assert.ErrorIs(t, st.DeleteAll(ctx, ""), storages.ErrUnsafeKey)
+
+	// WithUnsafe hands back the bare backend instead.
+	unsafe, err := New(ctx, cfg, WithUnsafe())
+	require.NoError(t, err)
+	_, ok := unsafe.(*Storage)
+	assert.True(t, ok, "WithUnsafe must yield the bare backend")
 }

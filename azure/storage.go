@@ -67,6 +67,29 @@ type containerAPI interface {
 	NewListBlobsFlatPager(o *container.ListBlobsFlatOptions) *runtime.Pager[container.ListBlobsFlatResponse]
 }
 
+// Option configures a Storage.
+type Option func(*Storage)
+
+// WithLogger sets the logger for the backend's diagnostic output, including the
+// Azure SDK's request/response logging (emitted when the logger is enabled at
+// debug level). Without this option the backend does not log at all.
+func WithLogger(logger *slog.Logger) Option {
+	return func(s *Storage) {
+		s.logger = logger
+	}
+}
+
+// WithUnsafe turns the key guard off. By default the storage returned by
+// New is guarded: a key that reaches outside the configured prefix or
+// that names the prefix itself is refused with storages.ErrUnsafeKey before any
+// request is sent. Pass this only when every key is known to be trusted and a
+// path with legitimate ".." segments has to get through.
+func WithUnsafe() Option {
+	return func(s *Storage) {
+		s.unsafe = true
+	}
+}
+
 // containerClientAdapter adapts the SDK's *container.Client to containerAPI. The
 // embedded client supplies every method directly except NewBlockBlobClient,
 // whose concrete return type must be narrowed to the blockBlobAPI seam.
@@ -84,6 +107,11 @@ type Storage struct {
 	prefix              string
 	uploadStreamOptions blockblob.UploadStreamOptions
 	logger              *slog.Logger
+	// unsafe records that the caller asked for the key guard to be left off. It
+	// is read once, at the end of New; nothing else consults it, because a
+	// sub-storage inherits its safety from the wrapper it was reached through
+	// rather than from a flag.
+	unsafe bool
 }
 
 // apiVersionPolicy overrides the x-ms-version header sent to Azure Storage.
@@ -133,11 +161,14 @@ func containerBaseURL(cfg Config) string {
 	return fmt.Sprintf("https://%s.blob.%s/%s", cfg.StorageAccount, suffix, cfg.Container)
 }
 
-// NewStorage builds an Azure Blob Storage backend from cfg. Pass WithLogger to
+// New builds an Azure Blob Storage backend from cfg. Pass WithLogger to
 // enable diagnostic output; without it the backend does not log at all. When a
 // logger is provided and enabled at debug level, the Azure SDK's request/response
 // logging is routed into it.
-func NewStorage(ctx context.Context, cfg Config, opts ...Option) (*Storage, error) {
+//
+// The returned storage is guarded: keys cannot escape cfg.Prefix. See WithUnsafe
+// to opt out.
+func New(ctx context.Context, cfg Config, opts ...Option) (storages.Storager, error) {
 	cfg.applyDefaults()
 	s := &Storage{config: cfg}
 	for _, opt := range opts {
@@ -193,19 +224,10 @@ func NewStorage(ctx context.Context, cfg Config, opts ...Option) (*Storage, erro
 		BlockSize:   int64(cfg.BufferSize),
 		Concurrency: cfg.MaxBuffers,
 	}
-	return s, nil
-}
-
-// Option configures a Storage.
-type Option func(*Storage)
-
-// WithLogger sets the logger for the backend's diagnostic output, including the
-// Azure SDK's request/response logging (emitted when the logger is enabled at
-// debug level). Without this option the backend does not log at all.
-func WithLogger(logger *slog.Logger) Option {
-	return func(s *Storage) {
-		s.logger = logger
+	if s.unsafe {
+		return s, nil
 	}
+	return storages.Guard(s), nil
 }
 
 func (s *Storage) GetCwd() string {
@@ -260,6 +282,93 @@ func (s *Storage) GetObject(ctx context.Context, filePath string) (reader io.Rea
 	return resp.Body, nil
 }
 
+func (s *Storage) GetObjectRange(
+	ctx context.Context, filePath string, offset, length int64,
+) (io.ReadCloser, error) {
+	if offset < 0 || length == 0 {
+		return nil, storages.ErrInvalidRange
+	}
+	// Azure's Count is 0-means-to-the-end (blob.CountToEnd), which is exactly
+	// what a negative length asks for; a range running past the end of the blob
+	// is clamped server-side.
+	count := length
+	if count < 0 {
+		count = blob.CountToEnd
+	}
+
+	blobClient := s.containerClient.NewBlockBlobClient(s.blobName(filePath))
+	resp, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
+		Range: blob.HTTPRange{Offset: offset, Count: count},
+	})
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, storages.ErrFileNotFound
+		}
+		if bloberror.HasCode(err, bloberror.InvalidRange) {
+			return nil, storages.ErrInvalidRange
+		}
+		return nil, fmt.Errorf("error getting object range: %w", err)
+	}
+
+	// Azure is not consistent about an offset that sits exactly at the end of the
+	// blob: it answers InvalidRange for an offset past the end, but a zero-length
+	// success for one right at it (which is every range on an empty blob). A
+	// non-empty range that yields no bytes is unsatisfiable either way — a length
+	// of 0 was already rejected above — so report it the way every other backend
+	// does.
+	if resp.ContentLength != nil && *resp.ContentLength == 0 {
+		s.closeQuietly(resp.Body, filePath)
+		return nil, storages.ErrInvalidRange
+	}
+	return resp.Body, nil
+}
+
+// closeQuietly closes c on an error path, where the close error is not what the
+// caller needs to hear about.
+func (s *Storage) closeQuietly(c io.Closer, filePath string) {
+	if err := c.Close(); err != nil && s.logger != nil {
+		s.logger.Warn("error closing blob body", "path", filePath, "error", err)
+	}
+}
+
+func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectStat, error) {
+	// The trailing slash is what keeps the prefix directory-like: without it
+	// "data" would also match the sibling "database".
+	fullPrefix := fixPrefix(path.Join(s.prefix, prefix))
+
+	// A flat pager is Azure's native recursive listing: no delimiter, so one
+	// paginated request covers the whole sub-tree instead of one per level.
+	pager := s.containerClient.NewListBlobsFlatPager(
+		&container.ListBlobsFlatOptions{Prefix: &fullPrefix},
+	)
+	res := []storages.ObjectStat{}
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("error listing azure blobs: %w", err)
+		}
+		// Azure returns blobs in lexicographic order by name, and every name here
+		// shares fullPrefix, so trimming it preserves that order.
+		for _, item := range page.Segment.BlobItems {
+			name := strings.TrimPrefix(*item.Name, fullPrefix)
+			if name == "" {
+				continue
+			}
+			stat := storages.ObjectStat{Name: name, Exist: true}
+			if item.Properties != nil {
+				if item.Properties.LastModified != nil {
+					stat.LastModified = *item.Properties.LastModified
+				}
+				if item.Properties.ContentLength != nil {
+					stat.Size = *item.Properties.ContentLength
+				}
+			}
+			res = append(res, stat)
+		}
+	}
+	return res, nil
+}
+
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
 	blobClient := s.containerClient.NewBlockBlobClient(s.blobName(filePath))
 	if _, err := blobClient.UploadStream(ctx, body, &s.uploadStreamOptions); err != nil {
@@ -310,8 +419,8 @@ func (s *Storage) deleteKnown(ctx context.Context, filePaths ...string) error {
 
 func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
 	pathPrefix = fixPrefix(pathPrefix)
-	ss := s.SubStorage(pathPrefix, true)
-	filesList, err := storages.Walk(ctx, ss)
+	sub := s.sub(pathPrefix, true)
+	filesList, err := storages.Walk(ctx, sub)
 	if err != nil {
 		return fmt.Errorf("error walking through storage: %w", err)
 	}
@@ -324,10 +433,6 @@ func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
 
 	// The blobs came straight from the walk above, so re-checking each one would
 	// be a GetProperties per blob for nothing.
-	sub, ok := ss.(*Storage)
-	if !ok {
-		return fmt.Errorf("expected *Storage from SubStorage, got %T", ss)
-	}
 	if err = sub.deleteKnown(ctx, filesList...); err != nil {
 		return fmt.Errorf("error deleting files: %w", err)
 	}
@@ -346,7 +451,16 @@ func (s *Storage) Exists(ctx context.Context, fileName string) (bool, error) {
 	return true, nil
 }
 
-func (s *Storage) SubStorage(subPath string, relative bool) storages.Storager {
+// SubStorage re-roots the backend onto another prefix, which sends no request,
+// so the error is always nil here: it exists for the storages that gate the
+// path, such as the key guard.
+func (s *Storage) SubStorage(subPath string, relative bool) (storages.Storager, error) {
+	return s.sub(subPath, relative), nil
+}
+
+// sub is SubStorage with the concrete type kept, for the internal callers that
+// need the backend's own methods.
+func (s *Storage) sub(subPath string, relative bool) *Storage {
 	prefix := subPath
 	if relative {
 		prefix = fixPrefix(path.Join(s.prefix, prefix))
@@ -373,11 +487,14 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 		return nil, fmt.Errorf("error getting object info: %w", err)
 	}
 
-	return &storages.ObjectStat{
-		Name:         fullPath,
-		LastModified: *props.LastModified,
-		Exist:        true,
-	}, nil
+	stat := &storages.ObjectStat{Name: fullPath, Exist: true}
+	if props.LastModified != nil {
+		stat.LastModified = *props.LastModified
+	}
+	if props.ContentLength != nil {
+		stat.Size = *props.ContentLength
+	}
+	return stat, nil
 }
 
 // Ping checks connectivity to the Azure container by fetching its properties.

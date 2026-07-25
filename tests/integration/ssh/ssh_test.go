@@ -158,10 +158,10 @@ func clientConfig() *cryptossh.ClientConfig {
 
 // newTestStorage returns a Storage pointed at a unique prefix under /upload in
 // the shared SFTP container.
-func newTestStorage(t *testing.T) *sshstorage.Storage {
+func newTestStorage(t *testing.T) storages.Storager {
 	t.Helper()
 	host, port := sftpEndpoint(t)
-	st, err := sshstorage.NewStorage(sshstorage.Config{
+	st, err := sshstorage.New(sshstorage.Config{
 		Host:     host,
 		Port:     port,
 		User:     sftpUser,
@@ -189,12 +189,12 @@ func rawSFTPClient(t *testing.T) *sftp.Client {
 	return client
 }
 
-func putObject(t *testing.T, st *sshstorage.Storage, key string, content []byte) {
+func putObject(t *testing.T, st storages.Storager, key string, content []byte) {
 	t.Helper()
 	require.NoError(t, st.PutObject(context.Background(), key, bytes.NewReader(content)))
 }
 
-func mustGet(t *testing.T, st *sshstorage.Storage, key string) []byte {
+func mustGet(t *testing.T, st storages.Storager, key string) []byte {
 	t.Helper()
 	r, err := st.GetObject(context.Background(), key)
 	require.NoError(t, err)
@@ -282,7 +282,8 @@ func TestSSHOps(t *testing.T) {
 
 	t.Run("sub storage", func(t *testing.T) {
 		st := newTestStorage(t)
-		sub := st.SubStorage("sub", true)
+		sub, err := st.SubStorage("sub", true)
+		require.NoError(t, err)
 		content := []byte("sub-storage-payload")
 		require.NoError(t, sub.PutObject(ctx, "test.txt", bytes.NewReader(content)))
 

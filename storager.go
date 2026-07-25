@@ -14,9 +14,10 @@
 
 // Package storages defines Storager, the backend-agnostic interface implemented
 // by every storage backend (directory, s3, azure, ssh, and the in-memory
-// inmemory backend), together with the shared ErrFileNotFound sentinel and the
-// Walk helper. It is the foundation package: backends import it, never the
-// reverse, so the dependency graph stays acyclic.
+// inmemory backend), together with the shared ErrFileNotFound, ErrInvalidRange
+// and ErrUnsafeKey sentinels, the Guard key gate and the Walk helper. It is the
+// foundation package: backends import it, never the reverse, so the dependency
+// graph stays acyclic.
 package storages
 
 import (
@@ -25,12 +26,18 @@ import (
 	"time"
 )
 
-// ObjectStat is the metadata returned by Storager.Stat. A missing object is
-// reported via Exist being false, not via an error.
+// ObjectStat is the metadata returned by Storager.Stat and by Storager.List. A
+// missing object is reported via Exist being false, not via an error.
+//
+// Name is filled differently by the two producers: Stat reports the full path it
+// was asked about (cwd-joined), while List reports a path relative to the prefix
+// it was given.
 type ObjectStat struct {
 	Name         string
 	LastModified time.Time
 	Exist        bool
+	// Size is the object's size in bytes. It is 0 when Exist is false.
+	Size int64
 }
 
 // Storager is the common interface implemented by every storage backend. It
@@ -45,6 +52,18 @@ type ObjectStat struct {
 // a value with a nil error. ListDir returns []Storager and SubStorage returns
 // Storager, which makes the interface self-referential — this is why the
 // interface lives in a foundation package that no backend may import back into.
+//
+// Every backend constructor in this module returns a guarded storage: a key
+// that reaches outside the storage — "../../etc/passwd" — or that names its
+// root is refused with ErrUnsafeKey before the backend resolves it, and the
+// storages SubStorage and ListDir return are guarded in turn. That makes it
+// safe to build keys out of untrusted input. Each backend's WithUnsafe option
+// turns the gate off for callers whose keys are all trusted; see Guard for what
+// exactly is refused.
+//
+// SubStorage is the one navigation method that can refuse: its sub-path is a
+// key like any other, and a guarded storage returns ErrUnsafeKey rather than a
+// storage rooted outside itself.
 type Storager interface {
 	// GetCwd returns the current working directory (root path/prefix) of this
 	// storage instance.
@@ -54,10 +73,34 @@ type Storager interface {
 	// ListDir lists the immediate contents of the current directory, returning
 	// the file names and a Storager for each sub-directory.
 	ListDir(ctx context.Context) (files []string, dirs []Storager, err error)
+	// List returns every object under prefix, recursively, with its size. The
+	// prefix is directory-like and relative to the current working directory, so
+	// an empty prefix lists the whole tree and the prefix "data" never matches
+	// the sibling "database". Returned names are slash-separated, relative to
+	// prefix, and sorted lexicographically; each ObjectStat has Exist true.
+	//
+	// Unlike DeleteAll, a prefix holding nothing is not an error: the result is
+	// an empty slice with a nil error, whether the prefix is empty or absent
+	// entirely. Listing a possibly-empty directory is an ordinary question, and
+	// it is the answer every backend gives natively.
+	List(ctx context.Context, prefix string) ([]ObjectStat, error)
 	// GetObject opens the object at filePath for reading. It returns
 	// ErrFileNotFound if the object does not exist. The caller must Close the
 	// returned reader.
 	GetObject(ctx context.Context, filePath string) (reader io.ReadCloser, err error)
+	// GetObjectRange opens a byte range of the object at filePath for reading.
+	// offset is counted from the start of the object and length is the number of
+	// bytes wanted; a negative length means "to the end of the object". The
+	// caller must Close the returned reader.
+	//
+	// A range whose end falls past the end of the object is clamped — the reader
+	// simply ends early — but a range that cannot yield anything at all is
+	// rejected with ErrInvalidRange: a negative offset, an offset at or past the
+	// object's size (which makes every range on a zero-length object invalid),
+	// or a length of exactly 0. Backends only transfer the requested bytes, so
+	// this is not GetObject plus a seek. A missing object is ErrFileNotFound,
+	// as in GetObject.
+	GetObjectRange(ctx context.Context, filePath string, offset, length int64) (reader io.ReadCloser, err error)
 	// PutObject writes body to the object at filePath, overwriting an existing
 	// object and creating any intermediate directories as needed.
 	PutObject(ctx context.Context, filePath string, body io.Reader) error
@@ -86,7 +129,12 @@ type Storager interface {
 	// path is joined onto the current working directory; otherwise it is used as
 	// an absolute root. The returned storage shares the parent's connection and
 	// configuration.
-	SubStorage(subPath string, relative bool) Storager
+	//
+	// Re-rooting reaches no backend, so the backends never fail here. The error
+	// is the storage's way of refusing the path: a guarded storage returns
+	// ErrUnsafeKey for a relative subPath that walks out of it, which is the one
+	// case where no storage can be returned at all.
+	SubStorage(subPath string, relative bool) (Storager, error)
 	// Stat returns metadata about fileName. A non-existent object is reported via
 	// ObjectStat.Exist being false with a nil error; an error means the lookup
 	// itself failed.

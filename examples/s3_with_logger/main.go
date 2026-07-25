@@ -78,7 +78,7 @@ func main() {
 	//    separately opts in to verbose AWS SDK diagnostics via v2's
 	//    ClientLogMode bitmask — the two concerns are decoupled. Drop
 	//    WithAWSLogLevel and only the backend's own messages are logged.
-	storage, err := s3.NewStorage(ctx, cfg,
+	storage, err := s3.New(ctx, cfg,
 		s3.WithLogger(logger),
 		s3.WithAWSLogLevel(aws.LogRequest|aws.LogRetries),
 	)
@@ -116,7 +116,10 @@ func runScenario(ctx context.Context, logger *slog.Logger, storage storages.Stor
 	// 6. Write two objects that share a sub-folder, addressed through a
 	//    SubStorage rooted at that folder. Relative=true joins it onto the
 	//    parent's current working directory.
-	sub := storage.SubStorage(subDir, true)
+	sub, err := storage.SubStorage(subDir, true)
+	if err != nil {
+		return fmt.Errorf("sub storage %s: %w", subDir, err)
+	}
 	for _, name := range []string{"q1.txt", "q2.txt"} {
 		logger.Info("creating file via substorage", "subdir", subDir, "file", name)
 		if err := sub.PutObject(ctx, name, strings.NewReader("quarterly report "+name)); err != nil {

@@ -15,8 +15,13 @@
 package directory
 
 import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/greenmaskio/storages"
@@ -31,4 +36,31 @@ func TestConformance(t *testing.T) {
 		require.NoError(t, err)
 		return st
 	})
+}
+
+// The conformance suite pins that the default storage is guarded. What it
+// cannot pin is that the opt-out really opts out — that the guard is a wrapper
+// the constructor chooses to apply rather than behavior baked into the backend.
+func TestWithUnsafeReachesOutsideTheDirectory(t *testing.T) {
+	ctx := context.Background()
+
+	base := t.TempDir()
+	root := filepath.Join(base, "store")
+	require.NoError(t, os.Mkdir(root, 0o750))
+	// A neighbour of the storage root, reachable only by climbing out of it.
+	require.NoError(t, os.WriteFile(filepath.Join(base, "victim.txt"), []byte("SECRET"), 0o600))
+
+	guarded, err := NewStorage(Config{Path: root})
+	require.NoError(t, err)
+	_, err = guarded.GetObject(ctx, "../victim.txt")
+	assert.ErrorIs(t, err, storages.ErrUnsafeKey, "the default storage must refuse the climb")
+
+	unsafe, err := NewStorage(Config{Path: root}, WithUnsafe())
+	require.NoError(t, err)
+	r, err := unsafe.GetObject(ctx, "../victim.txt")
+	require.NoError(t, err, "WithUnsafe hands the key straight to the filesystem")
+	defer func() { require.NoError(t, r.Close()) }()
+	content, err := io.ReadAll(r)
+	require.NoError(t, err)
+	assert.Equal(t, "SECRET", string(content))
 }

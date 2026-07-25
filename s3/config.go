@@ -45,7 +45,7 @@ type Config struct {
 
 // DefaultConfig returns a Config populated with sensible defaults. Set the
 // required fields (Bucket, and usually Region) on the result before passing it
-// to NewStorage.
+// to New.
 func DefaultConfig() Config {
 	c := Config{ForcePathStyle: defaultForcePath}
 	c.applyDefaults()
@@ -54,7 +54,7 @@ func DefaultConfig() Config {
 
 // applyDefaults fills unset numeric/string fields with their defaults so a
 // Config built as a struct literal behaves like one from DefaultConfig.
-// NewStorage calls this, so Config{Bucket: "..."} is a valid, complete config.
+// New calls this, so Config{Bucket: "..."} is a valid, complete config.
 //
 // Bool fields cannot be defaulted here: a false zero value is indistinguishable
 // from an explicit false, so ForcePathStyle's default (true) is applied only by

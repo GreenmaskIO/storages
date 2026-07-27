@@ -21,7 +21,7 @@ Requires Go 1.25+.
 Write your code against `storages.Storager`; pick the backend at construction:
 
 ```go
-st, err := directory.NewStorage(directory.Config{Path: "/var/dumps"})
+st, err := directory.NewStorage(directory.Config{RootPath: "/var/dumps"})
 if err != nil {
 	return err
 }
@@ -95,10 +95,10 @@ Pass the backend's `WithUnsafe()` option to opt out — the storage is then the
 bare backend, and paths with legitimate `..` segments go through:
 
 ```go
-st, err := directory.NewStorage(directory.Config{Path: "/var/dumps"})
+st, err := directory.NewStorage(directory.Config{RootPath: "/var/dumps"})
 _, err = st.GetObject(ctx, "../../etc/passwd") // storages.ErrUnsafeKey
 
-unsafe, err := directory.NewStorage(directory.Config{Path: "/var/dumps"}, directory.WithUnsafe())
+unsafe, err := directory.NewStorage(directory.Config{RootPath: "/var/dumps"}, directory.WithUnsafe())
 _, err = unsafe.GetObject(ctx, "../../etc/passwd") // reaches the filesystem
 ```
 
@@ -107,10 +107,16 @@ implemented outside this module.
 
 ## Backends
 
-**Directory** — local filesystem:
+**Directory** — local filesystem. `RootPath` is the mount point and must exist;
+the optional `Prefix` is the sub-tree the storage is rooted at, and
+`WithCreatePrefix()` creates it when it does not exist yet (the root is never
+created, so a typo there stays an error):
 
 ```go
-st, err := directory.NewStorage(directory.Config{Path: "/var/dumps"})
+st, err := directory.NewStorage(directory.Config{
+	RootPath: "/var/dumps",
+	Prefix:   "project/session",
+}, directory.WithCreatePrefix())
 ```
 
 **S3** — Amazon S3 and compatibles (MinIO, Ceph/RGW, Backblaze B2). A bare

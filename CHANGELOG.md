@@ -8,6 +8,29 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
+## [0.3.0] - 2026-07-27
+
+### Added
+
+- `directory.Config.Prefix` — an optional relative sub-path inside `RootPath`
+  that the storage is rooted at, bringing the directory backend in line with s3
+  (`Bucket` + `Prefix`) and ssh (host + `Prefix`). It is slash-separated on every
+  OS and the key guard keeps keys inside it; a prefix that is absolute or reaches
+  outside the root with `..` is refused.
+- `directory.WithCreatePrefix()` — creates a missing `Prefix`, intermediate
+  directories included, with mode `0750`. Without it a missing prefix is the new
+  `directory.ErrPrefixNotExists`. `RootPath` is never created: an absent root
+  stays an error, so a typo there cannot quietly produce a fresh empty tree.
+
+### Changed
+
+- **Breaking, `directory.Config`**: `Path` is replaced by `RootPath` (plus the
+  new optional `Prefix`). `directory.Config{Path: p}` becomes
+  `directory.Config{RootPath: p}`; the sentinel `ErrPathIsRequired` is renamed
+  `ErrRootPathIsRequired`.
+- `directory.NewStorage` now goes through `cfg.Validate()` rather than repeating
+  the existence check inline, so both report the same thing.
+
 ## [0.2.0] - 2026-07-23
 
 ### Added

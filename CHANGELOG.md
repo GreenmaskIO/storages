@@ -8,6 +8,14 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
+## [0.3.1] - 2026-07-28
+
+### Changed
+
+-  A nonexistent dir is an empty listing, matching the ssh and s3 backends: on an object store a directory 
+   holding nothing does not exist at all.
+
+
 ## [0.3.0] - 2026-07-27
 
 ### Added

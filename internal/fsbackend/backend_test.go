@@ -245,6 +245,22 @@ func TestListDir(t *testing.T) {
 	})
 }
 
+// A dir that does not exist lists as empty, matching the ssh and s3 backends:
+// on an object store a directory holding nothing does not exist at all.
+func TestListDirMissingDirIsEmpty(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, mk newStorage) {
+		s, _ := mk(t)
+		sub, err := s.SubStorage("nope", true)
+		require.NoError(t, err)
+
+		files, dirs, err := sub.ListDir(context.Background())
+
+		require.NoError(t, err)
+		assert.Empty(t, files)
+		assert.Empty(t, dirs)
+	})
+}
+
 func TestStat(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, mk newStorage) {
 		s, _ := mk(t)

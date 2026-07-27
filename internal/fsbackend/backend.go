@@ -160,6 +160,11 @@ func (s *Storage) Dirname() string {
 
 func (s *Storage) ListDir(_ context.Context) (files []string, dirs []storages.Storager, err error) {
 	entries, err := afero.ReadDir(s.fs, native(s.cwd))
+	// A nonexistent dir is an empty listing, matching the ssh and s3 backends:
+	// on an object store a directory holding nothing does not exist at all.
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, nil
+	}
 	if err != nil {
 		return nil, nil, err
 	}

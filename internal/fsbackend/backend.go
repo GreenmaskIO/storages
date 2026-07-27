@@ -59,6 +59,10 @@ type Storage struct {
 	// because a sub-storage inherits its safety from the wrapper it was reached
 	// through rather than from a flag.
 	unsafe bool
+	// createPrefix records that the caller asked for a missing prefix to be
+	// created. Like unsafe it is read once, by the wrapping backend's
+	// constructor, and never by a sub-storage.
+	createPrefix bool
 }
 
 // Option configures a Storage.
@@ -83,6 +87,15 @@ func WithUnsafe() Option {
 	}
 }
 
+// WithCreatePrefix asks the wrapping backend to create a missing prefix. This
+// package materializes directories on write regardless, so the flag only tells
+// a constructor whether to refuse a missing prefix or make it.
+func WithCreatePrefix() Option {
+	return func(s *Storage) {
+		s.createPrefix = true
+	}
+}
+
 // Guarded applies the library key guard to s unless WithUnsafe was passed at
 // construction. Backends wrapping this package call it on the way out of their
 // constructor, which is the one place the unsafe flag is read.
@@ -91,6 +104,13 @@ func Guarded(s *Storage) storages.Storager {
 		return s
 	}
 	return storages.Guard(s)
+}
+
+// CreatePrefixEnabled reports whether WithCreatePrefix was passed. Like Guarded
+// it lets a wrapping backend's constructor read the flag once, where the policy
+// lives.
+func CreatePrefixEnabled(s *Storage) bool {
+	return s.createPrefix
 }
 
 // toSlash converts a caller-supplied path to the internal forward-slash

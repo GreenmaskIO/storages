@@ -19,8 +19,11 @@ package directory
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/afero"
 
@@ -53,19 +56,62 @@ func WithUnsafe() Option {
 	return fsbackend.WithUnsafe()
 }
 
-// NewStorage opens the directory backend rooted at cfg.Path. The path must exist
-// and be a directory. Pass WithLogger to enable diagnostic output; without it the
-// backend does not log at all.
+// WithCreatePrefix creates a missing cfg.Prefix, intermediate directories
+// included, with mode 0750; without it NewStorage returns ErrPrefixNotExists.
+// cfg.RootPath is never created, so a typo in the root cannot quietly produce a
+// fresh empty tree.
+func WithCreatePrefix() Option {
+	return fsbackend.WithCreatePrefix()
+}
+
+// NewStorage opens the directory backend rooted at cfg.RootPath/cfg.Prefix.
+// RootPath must exist and be a directory. The prefix must exist too, unless
+// WithCreatePrefix is passed, in which case it is created. Pass WithLogger to
+// enable diagnostic output; without it the backend does not log at all.
 //
-// The returned storage is guarded: keys cannot escape cfg.Path. See WithUnsafe
-// to opt out.
+// The returned storage is guarded: keys cannot escape cfg.RootPath/cfg.Prefix.
+// See WithUnsafe to opt out.
 func NewStorage(cfg Config, opts ...Option) (storages.Storager, error) {
-	fileInfo, err := os.Stat(cfg.Path)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	prefix, err := cleanPrefix(cfg.Prefix)
 	if err != nil {
 		return nil, err
 	}
-	if !fileInfo.IsDir() {
-		return nil, errors.New("received directory path is file")
+	// filepath.Join, not path.Join: this is the OS-native path the os calls below
+	// act on. fsbackend converts it to its own slash convention.
+	root := filepath.Join(cfg.RootPath, filepath.FromSlash(prefix))
+
+	s := fsbackend.New(afero.NewOsFs(), root, opts...)
+	if err := ensurePrefix(root, fsbackend.CreatePrefixEnabled(s)); err != nil {
+		return nil, err
 	}
-	return fsbackend.Guarded(fsbackend.New(afero.NewOsFs(), cfg.Path, opts...)), nil
+	return fsbackend.Guarded(s), nil
+}
+
+// ensurePrefix settles the storage root before any object reaches it. With an
+// empty prefix root is RootPath, already validated, so this is just a stat.
+func ensurePrefix(root string, create bool) error {
+	info, err := os.Stat(root)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return fmt.Errorf("prefix path %q is a file", root)
+		}
+		return nil
+	case errors.Is(err, fs.ErrNotExist):
+		if !create {
+			return fmt.Errorf("%q: %w", root, ErrPrefixNotExists)
+		}
+		// MkdirAll creates only the missing segments of a partial prefix.
+		if err := os.MkdirAll(root, fsbackend.DirMode); err != nil {
+			return fmt.Errorf("error creating prefix directory: %w", err)
+		}
+		return nil
+	default:
+		// An intermediate segment that is a file, a permission error: the
+		// filesystem's answer to give, not ours to reinterpret.
+		return err
+	}
 }

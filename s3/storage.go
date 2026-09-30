@@ -127,7 +127,8 @@ func WithUnsafe() Option {
 	}
 }
 
-// New builds an S3 backend from cfg. Pass WithLogger to enable
+// New builds an S3 backend from cfg, refusing a config that fails
+// Config.Validate before any client is created. Pass WithLogger to enable
 // diagnostic output; without it the backend does not log at all. Verbose AWS
 // SDK request/response logging is off by default and is controlled separately
 // via WithAWSLogLevel.
@@ -136,6 +137,9 @@ func WithUnsafe() Option {
 // to opt out.
 func New(ctx context.Context, cfg Config, opts ...Option) (storages.Storager, error) {
 	cfg.applyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid s3 config: %w", err)
+	}
 	s := &Storage{config: cfg}
 	for _, opt := range opts {
 		opt(s)
@@ -451,7 +455,8 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 		StorageClass: types.StorageClass(s.config.StorageClass),
 	}
 
-	// TODO: Implement server side encryption
+	s.config.applyEncryption(ui)
+
 	if _, err := s.uploader.Upload(ctx, ui); err != nil {
 		return fmt.Errorf("s3 object uploading error: %w", err)
 	}

@@ -32,6 +32,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/minio"
 
 	"github.com/greenmaskio/storages"
@@ -40,11 +41,22 @@ import (
 
 const bucket = "test-bucket"
 
+// kmsKeyID names MinIO's built-in single-key KMS. MinIO needs a KMS backend for
+// any server-side encryption, AES256 included, so the container always runs
+// with one; plain uploads are unaffected. The secret is 32 bytes, base64.
+const (
+	kmsKeyID     = "storages-test-key"
+	kmsSecretKey = kmsKeyID + ":c3RvcmFnZXMtaW50ZWdyYXRpb24tdGVzdC1rZXkhISE="
+)
+
 var (
 	minioOnce      sync.Once
 	minioStorage   storages.Storager
 	minioContainer *minio.MinioContainer
 	minioErr       error
+	// minioConfig is the config minioStorage was built from, for tests that
+	// need a storage with different settings against the same server.
+	minioConfig s3storage.Config
 )
 
 // TestMain terminates the shared MinIO container (if one was started) after the
@@ -73,7 +85,9 @@ func requireMinio(t *testing.T) storages.Storager {
 }
 
 func startMinio(ctx context.Context) (storages.Storager, *minio.MinioContainer, error) {
-	container, err := minio.Run(ctx, "minio/minio:latest")
+	container, err := minio.Run(ctx, "minio/minio:latest",
+		testcontainers.WithEnv(map[string]string{"MINIO_KMS_SECRET_KEY": kmsSecretKey}),
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("starting minio: %w", err)
 	}
@@ -84,11 +98,13 @@ func startMinio(ctx context.Context) (storages.Storager, *minio.MinioContainer, 
 	}
 	endpointURL := "http://" + endpoint
 
-	// The bucket has to exist before any object operations. The backend exposes
-	// no bucket-management surface, so provision it with an independent client
-	// built from the same endpoint and credentials.
-	if err := createBucket(ctx, endpointURL, container.Username, container.Password); err != nil {
+	// The bucket has to exist before any object operations.
+	client, err := rawClient(ctx, endpointURL, container.Username, container.Password)
+	if err != nil {
 		return nil, container, err
+	}
+	if _, err := client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		return nil, container, fmt.Errorf("create bucket: %w", err)
 	}
 
 	cfg := s3storage.DefaultConfig()
@@ -104,10 +120,14 @@ func startMinio(ctx context.Context) (storages.Storager, *minio.MinioContainer, 
 	if err != nil {
 		return nil, container, fmt.Errorf("new storage: %w", err)
 	}
+	minioConfig = cfg
 	return st, container, nil
 }
 
-func createBucket(ctx context.Context, endpoint, accessKey, secretKey string) error {
+// rawClient builds an S3 client independent of the backend, for provisioning
+// and for reading back what actually landed in storage. The backend exposes no
+// bucket-management or object-metadata surface of its own.
+func rawClient(ctx context.Context, endpoint, accessKey, secretKey string) (*awss3.Client, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion("us-east-1"),
 		awsconfig.WithCredentialsProvider(
@@ -115,17 +135,13 @@ func createBucket(ctx context.Context, endpoint, accessKey, secretKey string) er
 		),
 	)
 	if err != nil {
-		return fmt.Errorf("aws config: %w", err)
+		return nil, fmt.Errorf("aws config: %w", err)
 	}
 
-	client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+	return awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
 		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
-	})
-	if _, err := client.CreateBucket(ctx, &awss3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
-		return fmt.Errorf("create bucket: %w", err)
-	}
-	return nil
+	}), nil
 }
 
 // mustSub re-roots st at subPath, failing the test if the storage refuses.

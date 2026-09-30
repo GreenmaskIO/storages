@@ -132,6 +132,21 @@ st, err := s3.NewStorage(ctx, s3.Config{
 })
 ```
 
+Server-side encryption applies to every upload: `SSE` is `AES256` (SSE-S3),
+`aws:kms` (SSE-KMS) or `aws:kms:dsse` (DSSE-KMS). `KMSKeyARN` and
+`BucketKeyEnabled` need a KMS-backed mode; `New` rejects any other combination
+rather than dropping the key. Reads need no settings. SSE-C is not supported.
+
+```go
+st, err := s3.NewStorage(ctx, s3.Config{
+	Bucket:           "my-bucket",
+	Region:           "us-east-1",
+	SSE:              "aws:kms",
+	KMSKeyARN:        "arn:aws:kms:us-east-1:123456789012:key/…",
+	BucketKeyEnabled: true,
+})
+```
+
 **Azure Blob:**
 
 ```go

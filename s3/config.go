@@ -14,6 +14,14 @@
 
 package s3
 
+import (
+	"fmt"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+)
+
 const (
 	defaultMaxRetries   = 3
 	defaultMaxPartSize  = 50 * 1024 * 1024
@@ -41,6 +49,16 @@ type Config struct {
 	ForcePathStyle   bool
 	UseAccelerate    bool
 	NoVerifySsl      bool
+	// SSE is the server-side encryption mode applied to every uploaded object:
+	// "AES256" (SSE-S3), "aws:kms" (SSE-KMS) or "aws:kms:dsse" (DSSE-KMS). Empty
+	// leaves the bucket's default encryption in charge. SSE-C is not supported.
+	SSE string
+	// KMSKeyARN is the KMS key to encrypt with. It requires a KMS-backed SSE;
+	// left empty with one, S3 uses the account's AWS managed key.
+	KMSKeyARN string
+	// BucketKeyEnabled turns on S3 Bucket Keys, which cuts KMS request cost on
+	// large uploads. It requires a KMS-backed SSE.
+	BucketKeyEnabled bool
 }
 
 // DefaultConfig returns a Config populated with sensible defaults. Set the
@@ -69,5 +87,59 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxPartSize == 0 {
 		c.MaxPartSize = defaultMaxPartSize
+	}
+}
+
+// sseIsKMS reports whether the configured SSE mode is one of the KMS-backed
+// modes, which are the only ones accepting KMSKeyARN and BucketKeyEnabled.
+func (c *Config) sseIsKMS() bool {
+	sse := types.ServerSideEncryption(c.SSE)
+	return sse == types.ServerSideEncryptionAwsKms || sse == types.ServerSideEncryptionAwsKmsDsse
+}
+
+// Validate rejects an incoherent encryption setup up front instead of letting it
+// fail on the first upload. Nothing is dropped silently: a KMS key with a
+// non-KMS mode would leave objects encrypted by something other than the key
+// that was asked for, so it is an error rather than a no-op.
+func (c *Config) Validate() error {
+	switch types.ServerSideEncryption(c.SSE) {
+	case "", types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms, types.ServerSideEncryptionAwsKmsDsse:
+	default:
+		return fmt.Errorf(
+			"unknown sse %q: must be one of %s, %s, %s", c.SSE,
+			types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms, types.ServerSideEncryptionAwsKmsDsse,
+		)
+	}
+
+	if c.sseIsKMS() {
+		return nil
+	}
+	if c.KMSKeyARN != "" {
+		return fmt.Errorf(
+			"kms key arn requires sse to be %s or %s",
+			types.ServerSideEncryptionAwsKms, types.ServerSideEncryptionAwsKmsDsse,
+		)
+	}
+	if c.BucketKeyEnabled {
+		return fmt.Errorf(
+			"bucket key enabled requires sse to be %s or %s",
+			types.ServerSideEncryptionAwsKms, types.ServerSideEncryptionAwsKmsDsse,
+		)
+	}
+	return nil
+}
+
+// applyEncryption sets the server-side encryption headers on an upload.
+// Validate guarantees the KMS-only options are set only with a KMS-backed mode.
+func (c *Config) applyEncryption(in *s3.PutObjectInput) {
+	if c.SSE == "" {
+		return
+	}
+	in.ServerSideEncryption = types.ServerSideEncryption(c.SSE)
+	if c.KMSKeyARN != "" {
+		in.SSEKMSKeyId = aws.String(c.KMSKeyARN)
+	}
+	if c.BucketKeyEnabled {
+		in.BucketKeyEnabled = aws.Bool(true)
 	}
 }

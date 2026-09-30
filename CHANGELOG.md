@@ -8,7 +8,7 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
-## [Unreleased]
+## [0.3.2] - 2026-09-30
 
 ### Added
 

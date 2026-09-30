@@ -8,12 +8,23 @@
 [![Discord](https://img.shields.io/discord/1179422525294399488?label=Discord&logo=discord)](https://discord.com/invite/rKBKvDECfd)
 
 Pluggable, backend-agnostic object storage for Go. One `Storager` interface,
-interchangeable backends: local directory, Amazon S3, Azure Blob, SSH/SFTP, and
-in-memory for tests. Object CRUD, byte-range reads and recursive listing with
-sizes — no presigned URLs or other provider-specific features. Keys are guarded
-by default, so none of them can address anything outside the storage.
+interchangeable backends. Object CRUD, byte-range reads and recursive listing
+with sizes — no presigned URLs or other provider-specific features. Keys are
+guarded by default, so none of them can address anything outside the storage.
 
 Extracted from [greenmask](https://github.com/greenmaskio/greenmask).
+
+## Supported backends
+
+| Backend | Package | Use for |
+|---|---|---|
+| [Directory](#directory) | [`directory`](directory) | Local filesystem |
+| [S3](#s3) | [`s3`](s3) | Amazon S3 and compatibles: MinIO, Ceph/RGW, Backblaze B2 |
+| [Azure Blob](#azure-blob) | [`azure`](azure) | Azure Blob Storage |
+| [SSH/SFTP](#sshsftp) | [`ssh`](ssh) | Remote host over SFTP |
+| [In-memory](#in-memory) | [`inmemory`](inmemory) | Tests — no I/O, no services |
+
+Need something else? See [Writing your own backend](#writing-your-own-backend).
 
 ## Install
 
@@ -90,7 +101,9 @@ Runnable example: [`examples/key_guard`](examples/key_guard).
 
 ## Backends
 
-**Directory** — local filesystem. `RootPath` is the mount point and must exist;
+### Directory
+
+Local filesystem. `RootPath` is the mount point and must exist;
 the optional `Prefix` is the sub-tree the storage is rooted at, and
 `WithCreatePrefix()` creates it when it does not exist yet (the root is never
 created, so a typo there stays an error):
@@ -102,7 +115,9 @@ st, err := directory.NewStorage(directory.Config{
 }, directory.WithCreatePrefix())
 ```
 
-**S3** — Amazon S3 and compatibles (MinIO, Ceph/RGW, Backblaze B2). A bare
+### S3
+
+Amazon S3 and compatibles (MinIO, Ceph/RGW, Backblaze B2). A bare
 `Config` is complete; defaults are filled in. For MinIO and most S3-compatible
 stores set `ForcePathStyle: true` explicitly. Runnable example:
 [`examples/s3_with_logger`](examples/s3_with_logger).
@@ -130,7 +145,7 @@ st, err := s3.NewStorage(ctx, s3.Config{
 })
 ```
 
-**Azure Blob:**
+### Azure Blob
 
 ```go
 st, err := azure.NewStorage(ctx, azure.Config{
@@ -140,7 +155,9 @@ st, err := azure.NewStorage(ctx, azure.Config{
 })
 ```
 
-**SSH/SFTP** — holds a real connection, so `Close()` matters. `SubStorage`
+### SSH/SFTP
+
+Holds a real connection, so `Close()` matters. `SubStorage`
 clones share the connection; closing any closes all. Operations on a closed
 storage return `ssh.ErrStorageClosed`.
 
@@ -153,7 +170,9 @@ st, err := ssh.NewStorage(ssh.Config{
 })
 ```
 
-**In-memory** — a full, conformant backend for tests; no I/O, no services:
+### In-memory
+
+A full, conformant backend for tests; no I/O, no services:
 
 ```go
 st := inmemory.New("")

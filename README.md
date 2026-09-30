@@ -1,5 +1,12 @@
 # storages
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/greenmaskio/storages.svg)](https://pkg.go.dev/github.com/greenmaskio/storages)
+[![CI](https://github.com/GreenmaskIO/storages/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/GreenmaskIO/storages/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/greenmaskio/storages)](https://github.com/greenmaskio/storages/releases/latest)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/greenmaskio/storages)](https://github.com/greenmaskio/storages/blob/main/go.mod)
+[![License](https://img.shields.io/github/license/greenmaskio/storages)](https://github.com/greenmaskio/storages/blob/main/LICENSE)
+[![Discord](https://img.shields.io/discord/1179422525294399488?label=Discord&logo=discord)](https://discord.com/invite/rKBKvDECfd)
+
 Pluggable, backend-agnostic object storage for Go. One `Storager` interface,
 interchangeable backends: local directory, Amazon S3, Azure Blob, SSH/SFTP, and
 in-memory for tests. Object CRUD, byte-range reads and recursive listing with
@@ -75,35 +82,11 @@ Semantics, uniform across all backends:
 
 ## Safety: the key guard
 
-A bare backend resolves a key by joining it onto the storage root and going
-straight to the filesystem or object store, which makes `../../etc/passwd` a
-read outside the storage and `DeleteAll("")` a removal of the storage itself.
-So every constructor here returns a **guarded** storage: keys are checked
-before they reach the backend, and a key that
-
-- climbs out of the storage (`../victim`, `a/../../victim` — checked after
-  cleaning, so an interior `a/../b` is fine),
-- is absolute (`/etc/passwd`), or
-- names the storage root itself (`""`, `"."`, on the object methods)
-
-is refused with `storages.ErrUnsafeKey`. `SubStorage` and `ListDir` hand back
-guarded storages too, so navigating down cannot navigate out: a relative
-`SubStorage` path that escapes comes back as an error instead of a storage.
-Keys can therefore be built out of untrusted input.
-
-Pass the backend's `WithUnsafe()` option to opt out — the storage is then the
-bare backend, and paths with legitimate `..` segments go through:
-
-```go
-st, err := directory.NewStorage(directory.Config{RootPath: "/var/dumps"})
-_, err = st.GetObject(ctx, "../../etc/passwd") // storages.ErrUnsafeKey
-
-unsafe, err := directory.NewStorage(directory.Config{RootPath: "/var/dumps"}, directory.WithUnsafe())
-_, err = unsafe.GetObject(ctx, "../../etc/passwd") // reaches the filesystem
-```
-
-`storages.Guard(st)` applies the same gate to any `Storager`, including one
-implemented outside this module.
+Storages are guarded by default: a key that escapes the storage (`../x`), is
+absolute (`/etc/passwd`) or names the storage root itself is refused with
+`storages.ErrUnsafeKey`, so keys can be built from untrusted input. Opt out per
+backend with `WithUnsafe()`; wrap your own `Storager` with `storages.Guard`.
+Runnable example: [`examples/key_guard`](examples/key_guard).
 
 ## Backends
 

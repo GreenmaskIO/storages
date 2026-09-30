@@ -431,6 +431,52 @@ func TestStorage_PutObject(t *testing.T) {
 	}
 }
 
+func TestStorage_PutObject_Encryption(t *testing.T) {
+	tests := []struct {
+		name          string
+		sse           string
+		kmsKeyARN     string
+		bucketKey     bool
+		wantSSE       types.ServerSideEncryption
+		wantKMSKeyID  *string
+		wantBucketKey *bool
+	}{
+		{name: "none by default"},
+		{name: "sse-s3", sse: "AES256", wantSSE: types.ServerSideEncryptionAes256},
+		{name: "sse-kms with key", sse: "aws:kms", kmsKeyARN: testKMSKeyARN,
+			wantSSE: types.ServerSideEncryptionAwsKms, wantKMSKeyID: aws.String(testKMSKeyARN)},
+		{name: "dsse-kms with key", sse: "aws:kms:dsse", kmsKeyARN: testKMSKeyARN,
+			wantSSE: types.ServerSideEncryptionAwsKmsDsse, wantKMSKeyID: aws.String(testKMSKeyARN)},
+		{name: "sse-kms without key uses the aws managed key", sse: "aws:kms",
+			wantSSE: types.ServerSideEncryptionAwsKms},
+		{name: "sse-kms with bucket key", sse: "aws:kms", bucketKey: true,
+			wantSSE: types.ServerSideEncryptionAwsKms, wantBucketKey: aws.Bool(true)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			up := &mockUploader{}
+			up.On("Upload", mock.Anything, mock.Anything).Return(&manager.UploadOutput{}, nil)
+			st := newStorage(t, "dumps/", nil, up)
+			st.config.SSE = tt.sse
+			st.config.KMSKeyARN = tt.kmsKeyARN
+			st.config.BucketKeyEnabled = tt.bucketKey
+
+			// Act
+			err := st.PutObject(context.Background(), "a.txt", bytes.NewReader([]byte("data")))
+
+			// Assert
+			require.NoError(t, err)
+			put := up.lastPut()
+			require.NotNil(t, put)
+			assert.Equal(t, tt.wantSSE, put.ServerSideEncryption)
+			assert.Equal(t, tt.wantKMSKeyID, put.SSEKMSKeyId)
+			assert.Equal(t, tt.wantBucketKey, put.BucketKeyEnabled)
+		})
+	}
+}
+
 func TestStorage_GetObject(t *testing.T) {
 	tests := []struct {
 		name        string

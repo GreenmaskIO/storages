@@ -8,6 +8,19 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
+## [Unreleased]
+
+### Added
+
+- S3 server-side encryption: `s3.Config.SSE` (`AES256`, `aws:kms` or
+  `aws:kms:dsse`) is applied to every upload, multipart ones included.
+  `KMSKeyARN` picks the KMS key and `BucketKeyEnabled` turns on
+  [S3 Bucket Keys](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html)
+  to cut KMS request cost. Reads need no settings. SSE-C is not supported.
+- `s3.Config.Validate()`, which `s3.New` now calls. It rejects an unknown
+  `SSE`, and `KMSKeyARN` or `BucketKeyEnabled` without a KMS-backed `SSE`,
+  instead of silently encrypting with a key other than the one configured.
+
 ## [0.3.1] - 2026-07-28
 
 ### Changed

@@ -14,7 +14,11 @@
 #   user/pass -> minioadmin / minioadmin (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY)
 services:
   minio:
-    image: minio/minio:latest
+    # Chainguard's MinIO build: the upstream minio/minio image is no longer
+    # published on Docker Hub. Its non-root default user cannot run the server
+    # on /data, hence root.
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -32,8 +36,9 @@ services:
 
   # One-shot init container: waits for MinIO, then creates the bucket the
   # example expects. It exits 0 once done — `docker compose up -d` stays healthy.
+  # It reuses the server image, which ships both mc and a shell.
   createbucket:
-    image: minio/mc:latest
+    image: cgr.dev/chainguard/minio:latest
     depends_on:
       minio:
         condition: service_healthy

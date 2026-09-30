@@ -30,6 +30,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	dockercontainer "github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -40,6 +41,10 @@ import (
 )
 
 const bucket = "test-bucket"
+
+// minioImage is Chainguard's MinIO build: the upstream minio/minio image is no
+// longer published on Docker Hub.
+const minioImage = "cgr.dev/chainguard/minio:latest"
 
 // kmsKeyID names MinIO's built-in single-key KMS. MinIO needs a KMS backend for
 // any server-side encryption, AES256 included, so the container always runs
@@ -85,8 +90,11 @@ func requireMinio(t *testing.T) storages.Storager {
 }
 
 func startMinio(ctx context.Context) (storages.Storager, *minio.MinioContainer, error) {
-	container, err := minio.Run(ctx, "minio/minio:latest",
+	container, err := minio.Run(ctx, minioImage,
 		testcontainers.WithEnv(map[string]string{"MINIO_KMS_SECRET_KEY": kmsSecretKey}),
+		// The image's non-root default user cannot run the server on the /data
+		// the module points it at: MinIO fails its first rename under it.
+		testcontainers.WithConfigModifier(func(c *dockercontainer.Config) { c.User = "0:0" }),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("starting minio: %w", err)

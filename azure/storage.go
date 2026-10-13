@@ -18,6 +18,7 @@ package azure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
@@ -53,6 +55,9 @@ type blockBlobAPI interface {
 	UploadStream(ctx context.Context, body io.Reader, o *blockblob.UploadStreamOptions) (blockblob.UploadStreamResponse, error)
 	Delete(ctx context.Context, o *blob.DeleteOptions) (blob.DeleteResponse, error)
 	GetProperties(ctx context.Context, o *blob.GetPropertiesOptions) (blob.GetPropertiesResponse, error)
+	URL() string
+	StartCopyFromURL(ctx context.Context, copySource string, o *blob.StartCopyFromURLOptions) (blob.StartCopyFromURLResponse, error)
+	AbortCopyFromURL(ctx context.Context, copyID string, o *blob.AbortCopyFromURLOptions) (blob.AbortCopyFromURLResponse, error)
 }
 
 // containerAPI is the narrow set of container operations Storage depends on. It
@@ -133,7 +138,11 @@ func (p *apiVersionPolicy) Do(req *policy.Request) (*http.Response, error) {
 func buildClientOptions(cfg Config) *container.ClientOptions {
 	opts := &container.ClientOptions{
 		ClientOptions: policy.ClientOptions{
-			Retry: policy.RetryOptions{TryTimeout: time.Minute * time.Duration(cfg.TryTimeout)},
+			Retry: policy.RetryOptions{
+				TryTimeout: time.Minute * time.Duration(cfg.TryTimeout),
+				// 0 leaves azcore's default of 3.
+				MaxRetries: int32(cfg.MaxRetries),
+			},
 		},
 	}
 	if cfg.BlobStoreAPIVersion != "" {
@@ -362,6 +371,9 @@ func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectSta
 				if item.Properties.ContentLength != nil {
 					stat.Size = *item.Properties.ContentLength
 				}
+				if item.Properties.ETag != nil {
+					stat.ETag = entityTag(*item.Properties.ETag)
+				}
 			}
 			res = append(res, stat)
 		}
@@ -375,6 +387,156 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 		return fmt.Errorf("azure object uploading error: %w", err)
 	}
 	return nil
+}
+
+// Copy copies srcPath to dstPath server-side, waiting for the asynchronous copy
+// and aborting it if ctx ends. A refused copy fails unless WithClientSideCopyFallback
+// is given; a pending copy that fails or is aborted leaves the destination empty.
+func (s *Storage) Copy(
+	ctx context.Context, srcPath, dstPath string, opts ...storages.CopyOption,
+) (storages.CopyStat, error) {
+	o := storages.NewCopyOptions(opts...)
+	srcName := s.blobName(srcPath)
+	dstName := s.blobName(dstPath)
+	src := s.containerClient.NewBlockBlobClient(srcName)
+
+	// A copy onto itself is a no-op, but the source must still exist.
+	if srcName == dstName {
+		if _, err := src.GetProperties(ctx, nil); err != nil {
+			if bloberror.HasCode(err, bloberror.BlobNotFound) {
+				return storages.CopyStat{}, storages.ErrFileNotFound
+			}
+			return storages.CopyStat{}, fmt.Errorf("error getting object info: %w", err)
+		}
+		return storages.CopyStat{}, nil
+	}
+
+	dst := s.containerClient.NewBlockBlobClient(dstName)
+	resp, err := dst.StartCopyFromURL(ctx, src.URL(), nil)
+	if err != nil {
+		switch {
+		case bloberror.HasCode(err, bloberror.BlobNotFound):
+			return storages.CopyStat{}, storages.ErrFileNotFound
+		case bloberror.HasCode(err,
+			bloberror.CannotVerifyCopySource,
+			bloberror.AuthorizationFailure,
+			bloberror.AuthorizationPermissionMismatch,
+		):
+			return s.copyRefused(ctx, src, srcPath, dstPath, err, o)
+		}
+		return storages.CopyStat{}, fmt.Errorf("azure object copying error: %w", err)
+	}
+
+	var props blob.GetPropertiesResponse
+	if resp.CopyStatus != nil && *resp.CopyStatus == blob.CopyStatusTypeSuccess {
+		// The copy response carries no size.
+		if props, err = dst.GetProperties(ctx, nil); err != nil {
+			return storages.CopyStat{}, fmt.Errorf("error getting copy info: %w", err)
+		}
+	} else {
+		if resp.CopyID == nil {
+			return storages.CopyStat{}, fmt.Errorf("azure object copying error: copy of %q started without a copy id", srcPath)
+		}
+		if props, err = s.awaitCopy(ctx, dst, *resp.CopyID, o); err != nil {
+			return storages.CopyStat{}, err
+		}
+	}
+	var stat storages.CopyStat
+	if props.ContentLength != nil {
+		stat.Bytes = *props.ContentLength
+	}
+	return stat, nil
+}
+
+// copyRefused handles a refused server-side copy. Azure reports a missing source
+// the same way, so the source is checked first.
+func (s *Storage) copyRefused(
+	ctx context.Context, src blockBlobAPI, srcPath, dstPath string, refusal error, o storages.CopyOptions,
+) (storages.CopyStat, error) {
+	if _, err := src.GetProperties(ctx, nil); err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return storages.CopyStat{}, storages.ErrFileNotFound
+		}
+		return storages.CopyStat{}, fmt.Errorf("azure object copying error: %w (checking the source: %w)", refusal, err)
+	}
+	if !o.ClientSideFallback {
+		return storages.CopyStat{}, fmt.Errorf("azure object copying error: %w", refusal)
+	}
+	if s.logger != nil {
+		s.logger.Info("server-side copy refused, streaming the blob instead",
+			"src", srcPath, "dst", dstPath, "error", refusal)
+	}
+	return storages.StreamCopy(ctx, s, srcPath, dstPath)
+}
+
+// copyPollIntervals resolves the poll intervals: option, then Config, then default.
+func (s *Storage) copyPollIntervals(o storages.CopyOptions) (interval, maxInterval time.Duration) {
+	cfg := s.config
+	if o.PollInterval > 0 {
+		cfg.CopyPollInterval = o.PollInterval
+	}
+	if o.PollMaxInterval > 0 {
+		cfg.CopyPollMaxInterval = o.PollMaxInterval
+	}
+	return cfg.copyPollIntervals()
+}
+
+// awaitCopy polls dst until copyID leaves the pending state and returns the
+// properties from the successful poll. If ctx ends first, the copy is aborted.
+func (s *Storage) awaitCopy(
+	ctx context.Context, dst blockBlobAPI, copyID string, o storages.CopyOptions,
+) (blob.GetPropertiesResponse, error) {
+	var none blob.GetPropertiesResponse
+	interval, maxInterval := s.copyPollIntervals(o)
+	for {
+		select {
+		case <-ctx.Done():
+			return none, s.abortCopy(ctx, dst, copyID)
+		case <-time.After(interval):
+		}
+		interval = min(interval*2, maxInterval)
+
+		props, err := dst.GetProperties(ctx, nil)
+		if err != nil {
+			if ctx.Err() != nil {
+				return none, s.abortCopy(ctx, dst, copyID)
+			}
+			// Abort so a Copy that reports failure does not still change dst.
+			return none, errors.Join(
+				fmt.Errorf("error checking copy status: %w", err),
+				s.abortCopy(ctx, dst, copyID),
+			)
+		}
+		// A different copy id means another write replaced the destination.
+		if props.CopyID == nil || *props.CopyID != copyID {
+			return none, fmt.Errorf("azure object copying error: copy %s was superseded at the destination", copyID)
+		}
+		// Without a status there is nothing to wait for, and waiting would never end.
+		if props.CopyStatus == nil {
+			return none, fmt.Errorf("azure object copying error: copy %s reported no status", copyID)
+		}
+		switch *props.CopyStatus {
+		case blob.CopyStatusTypePending:
+			continue
+		case blob.CopyStatusTypeSuccess:
+			return props, nil
+		default:
+			reason := string(*props.CopyStatus)
+			if props.CopyStatusDescription != nil && *props.CopyStatusDescription != "" {
+				reason += ": " + *props.CopyStatusDescription
+			}
+			return none, fmt.Errorf("azure object copying error: copy %s %s", copyID, reason)
+		}
+	}
+}
+
+// abortCopy aborts the copy best-effort, detached from ctx, and returns ctx's
+// error.
+func (s *Storage) abortCopy(ctx context.Context, dst blockBlobAPI, copyID string) error {
+	if _, err := dst.AbortCopyFromURL(context.WithoutCancel(ctx), copyID, nil); err != nil && s.logger != nil {
+		s.logger.Warn("error aborting blob copy", "copy_id", copyID, "error", err)
+	}
+	return ctx.Err()
 }
 
 // Delete removes the named objects. Every blob is verified to exist first, so a
@@ -415,6 +577,13 @@ func (s *Storage) deleteKnown(ctx context.Context, filePaths ...string) error {
 		}
 	}
 	return nil
+}
+
+// CopyAll copies every object under srcPrefix to dstPrefix with storages.CopyEach.
+func (s *Storage) CopyAll(
+	ctx context.Context, srcPrefix, dstPrefix string, opts ...storages.CopyAllOption,
+) (storages.CopyStat, error) {
+	return storages.CopyEach(ctx, s, srcPrefix, dstPrefix, opts...)
 }
 
 func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
@@ -494,7 +663,19 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 	if props.ContentLength != nil {
 		stat.Size = *props.ContentLength
 	}
+	if props.ETag != nil {
+		stat.ETag = entityTag(*props.ETag)
+	}
 	return stat, nil
+}
+
+// entityTag quotes etag: Azure quotes it in properties but not in listings.
+func entityTag(etag azcore.ETag) string {
+	s := string(etag)
+	if strings.HasPrefix(s, `"`) || strings.HasPrefix(s, `W/"`) {
+		return s
+	}
+	return `"` + s + `"`
 }
 
 // Ping checks connectivity to the Azure container by fetching its properties.

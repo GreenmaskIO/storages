@@ -135,4 +135,30 @@ func TestStorage_SSE(t *testing.T) {
 		assert.Equal(t, types.ServerSideEncryptionAwsKms, out.ServerSideEncryption)
 		assert.Contains(t, aws.ToString(out.SSEKMSKeyId), kmsKeyID)
 	})
+
+	// The source is written unencrypted, so only the copy request can have
+	// encrypted the result.
+	t.Run("copy carries sse-kms", func(t *testing.T) {
+		st := newStorage(t, "sse-kms-copy", "aws:kms", kmsKeyID, false, 0)
+		body := []byte("copied under sse-kms")
+		_, err := raw.PutObject(ctx, &awss3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(st.GetCwd() + "plain.txt"),
+			Body:   bytes.NewReader(body),
+		})
+		require.NoError(t, err)
+
+		stat, err := st.Copy(ctx, "plain.txt", "copy.txt")
+		require.NoError(t, err)
+		assert.Equal(t, storages.CopyStat{Bytes: int64(len(body))}, stat)
+
+		out, err := raw.HeadObject(ctx, &awss3.HeadObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(st.GetCwd() + "copy.txt"),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, types.ServerSideEncryptionAwsKms, out.ServerSideEncryption)
+		assert.Contains(t, aws.ToString(out.SSEKMSKeyId), kmsKeyID)
+		assert.Equal(t, int64(len(body)), aws.ToInt64(out.ContentLength))
+	})
 }

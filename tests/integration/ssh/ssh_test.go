@@ -335,6 +335,46 @@ func TestSSHOps(t *testing.T) {
 		assert.True(t, ok)
 	})
 
+	t.Run("copy_all streams through the client", func(t *testing.T) {
+		st := newTestStorage(t)
+		putObject(t, st, "books/a.txt", []byte("a"))
+		putObject(t, st, "books/sci/b.txt", []byte("bb"))
+
+		stat, err := st.CopyAll(ctx, "books", "archive/books")
+		require.NoError(t, err)
+
+		assert.Equal(t, storages.CopyStat{Bytes: 3, Streamed: true, Objects: 2}, stat)
+		assert.Equal(t, []byte("a"), mustGet(t, st, "archive/books/a.txt"))
+		assert.Equal(t, []byte("bb"), mustGet(t, st, "archive/books/sci/b.txt"))
+	})
+
+	// An unguarded storage passes keys uncleaned; the temporary must still land
+	// next to the cleaned destination.
+	t.Run("copy to an uncleaned key when unguarded", func(t *testing.T) {
+		host, port := sftpEndpoint(t)
+		st, err := sshstorage.New(sshstorage.Config{
+			Host:     host,
+			Port:     port,
+			User:     sftpUser,
+			Password: sftpPassword,
+			Prefix:   fmt.Sprintf("/upload/test-%d", prefixCounter.Add(1)),
+		}, sshstorage.WithUnsafe())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = st.Close() })
+		putObject(t, st, "src.txt", []byte("new"))
+
+		for _, dst := range []string{"dir/a.txt/", "dir/sub/../b.txt", "dir//c.txt"} {
+			_, err := st.Copy(ctx, "src.txt", dst)
+			require.NoError(t, err, dst)
+		}
+
+		files, err := storages.Walk(ctx, st)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []string{"src.txt", "dir/a.txt", "dir/b.txt", "dir/c.txt"}, files,
+			"no temporary or stray directory is left behind")
+		assert.Equal(t, []byte("new"), mustGet(t, st, "dir/a.txt"))
+	})
+
 	t.Run("delete_all", func(t *testing.T) {
 		st := newTestStorage(t)
 		putObject(t, st, "books/a.txt", []byte("a"))

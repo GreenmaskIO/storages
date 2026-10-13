@@ -17,6 +17,7 @@ package azure
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Defaults and constants for the Azure Blob Storage backend.
@@ -27,6 +28,12 @@ const (
 	defaultBuffers    = 4
 	defaultTryTimeout = 5
 	defaultEnvName    = "AzurePublicCloud"
+
+	// defaultCopyPollInterval is short: a same-account copy usually finishes
+	// before the request that started it returns.
+	defaultCopyPollInterval = 50 * time.Millisecond
+	// defaultCopyPollMaxInterval caps the doubling wait between copy checks.
+	defaultCopyPollMaxInterval = 2 * time.Second
 )
 
 // authType identifies which credential method was resolved from the config.
@@ -50,7 +57,12 @@ type Config struct {
 	BufferSize          int    // upload block size, default 8MiB, min 1KiB
 	MaxBuffers          int    // upload concurrency, default 4, min 1
 	TryTimeout          int    // minutes, default 5
+	MaxRetries          int    // retries after a failed try (5xx, 408, 429, network), default 3, negative for none
 	BlobStoreAPIVersion string // optional x-ms-version override
+	// CopyPollInterval is Copy's first poll wait, doubled up to
+	// CopyPollMaxInterval. Defaults: 50ms and 2s.
+	CopyPollInterval    time.Duration
+	CopyPollMaxInterval time.Duration
 }
 
 // DefaultConfig returns a Config populated with sensible defaults. Set the
@@ -78,6 +90,20 @@ func (c *Config) applyDefaults() {
 	if c.TryTimeout == 0 {
 		c.TryTimeout = defaultTryTimeout
 	}
+	c.CopyPollInterval, c.CopyPollMaxInterval = c.copyPollIntervals()
+}
+
+// copyPollIntervals returns the copy poll intervals with defaults for unset or
+// negative values, and the max raised to at least the first interval.
+func (c *Config) copyPollIntervals() (interval, maxInterval time.Duration) {
+	interval, maxInterval = c.CopyPollInterval, c.CopyPollMaxInterval
+	if interval <= 0 {
+		interval = defaultCopyPollInterval
+	}
+	if maxInterval <= 0 {
+		maxInterval = defaultCopyPollMaxInterval
+	}
+	return interval, max(maxInterval, interval)
 }
 
 // Validate ensures the required fields are present and clamps the upload

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -146,6 +147,36 @@ func TestConfig_Defaults(t *testing.T) {
 	assert.Equal(t, minBuffers, cfg.MaxBuffers)
 }
 
+func TestConfig_CopyPollIntervals(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.Equal(t, defaultCopyPollInterval, cfg.CopyPollInterval)
+	assert.Equal(t, defaultCopyPollMaxInterval, cfg.CopyPollMaxInterval)
+
+	cfg = Config{CopyPollInterval: time.Second, CopyPollMaxInterval: 10 * time.Second}
+	cfg.applyDefaults()
+	assert.Equal(t, time.Second, cfg.CopyPollInterval)
+	assert.Equal(t, 10*time.Second, cfg.CopyPollMaxInterval)
+
+	cfg = Config{CopyPollInterval: 5 * time.Second, CopyPollMaxInterval: -1}
+	cfg.applyDefaults()
+	assert.Equal(t, 5*time.Second, cfg.CopyPollMaxInterval, "the max is raised to the first interval")
+}
+
+func TestStorage_copyPollIntervals(t *testing.T) {
+	st := &Storage{config: Config{CopyPollInterval: time.Second, CopyPollMaxInterval: 4 * time.Second}}
+
+	interval, maxInterval := st.copyPollIntervals(storages.NewCopyOptions())
+	assert.Equal(t, []time.Duration{time.Second, 4 * time.Second}, []time.Duration{interval, maxInterval}, "the config")
+
+	interval, maxInterval = st.copyPollIntervals(storages.NewCopyOptions(storages.WithCopyPollInterval(10*time.Millisecond, 0)))
+	assert.Equal(t, []time.Duration{10 * time.Millisecond, 4 * time.Second}, []time.Duration{interval, maxInterval},
+		"an option overrides the config field by field")
+
+	interval, maxInterval = (&Storage{}).copyPollIntervals(storages.NewCopyOptions())
+	assert.Equal(t, []time.Duration{defaultCopyPollInterval, defaultCopyPollMaxInterval}, []time.Duration{interval, maxInterval},
+		"the defaults")
+}
+
 func TestContainerBaseURL(t *testing.T) {
 	t.Run("endpoint override is path-style", func(t *testing.T) {
 		cfg := DefaultConfig()
@@ -178,6 +209,14 @@ func TestBuildClientOptions(t *testing.T) {
 		opts := buildClientOptions(cfg)
 		assert.Equal(t, 7*time.Minute, opts.Retry.TryTimeout)
 		assert.Empty(t, opts.PerCallPolicies, "no api-version policy without an override")
+	})
+
+	t.Run("max retries maps to retry options", func(t *testing.T) {
+		for _, n := range []int{0, 5, -1} {
+			cfg := DefaultConfig()
+			cfg.MaxRetries = n
+			assert.Equal(t, int32(n), buildClientOptions(cfg).Retry.MaxRetries)
+		}
 	})
 
 	t.Run("api version policy appended only when configured", func(t *testing.T) {
@@ -451,6 +490,27 @@ func (m *mockBlockBlob) GetProperties(
 	return out, args.Error(1)
 }
 
+func (m *mockBlockBlob) URL() string {
+	args := m.Called()
+	return args.String(0)
+}
+
+func (m *mockBlockBlob) StartCopyFromURL(
+	ctx context.Context, copySource string, o *blob.StartCopyFromURLOptions,
+) (blob.StartCopyFromURLResponse, error) {
+	args := m.Called(ctx, copySource, o)
+	out, _ := args.Get(0).(blob.StartCopyFromURLResponse)
+	return out, args.Error(1)
+}
+
+func (m *mockBlockBlob) AbortCopyFromURL(
+	ctx context.Context, copyID string, o *blob.AbortCopyFromURLOptions,
+) (blob.AbortCopyFromURLResponse, error) {
+	args := m.Called(ctx, copyID, o)
+	out, _ := args.Get(0).(blob.AbortCopyFromURLResponse)
+	return out, args.Error(1)
+}
+
 // deleteBlob returns a block-blob double that exists (GetProperties succeeds)
 // and whose Delete yields the given error.
 func deleteBlob(err error) *mockBlockBlob {
@@ -567,6 +627,7 @@ func flatPage(blobs ...flatBlob) container.ListBlobsFlatResponse {
 			Properties: &container.BlobProperties{
 				ContentLength: to.Ptr(b.size),
 				LastModified:  to.Ptr(flatListModTime),
+				ETag:          to.Ptr(azcore.ETag(`"` + b.name + `"`)),
 			},
 		})
 	}
@@ -890,6 +951,7 @@ func TestStorage_List(t *testing.T) {
 		assert.Equal(t, int64(1), objects[0].Size)
 		assert.True(t, objects[0].Exist)
 		assert.True(t, objects[0].LastModified.Equal(flatListModTime))
+		assert.Equal(t, `"p/a.txt"`, objects[0].ETag)
 		assert.Equal(t, "dir/b.txt", objects[1].Name)
 		assert.Equal(t, int64(22), objects[1].Size)
 		c.AssertExpectations(t)
@@ -1009,7 +1071,9 @@ func TestStorage_Stat(t *testing.T) {
 					Return(blob.GetPropertiesResponse{}, tt.getErr)
 			} else {
 				bb.On("GetProperties", mock.Anything, mock.Anything).
-					Return(blob.GetPropertiesResponse{LastModified: to.Ptr(modTime), ContentLength: to.Ptr(int64(42))}, nil)
+					Return(blob.GetPropertiesResponse{
+						LastModified: to.Ptr(modTime), ContentLength: to.Ptr(int64(42)), ETag: to.Ptr(azcore.ETag(`"e1"`)),
+					}, nil)
 			}
 			c := &mockContainer{}
 			c.On("NewBlockBlobClient", mock.Anything).Return(bb)
@@ -1036,6 +1100,7 @@ func TestStorage_Stat(t *testing.T) {
 			assert.True(t, stat.Exist)
 			assert.True(t, stat.LastModified.Equal(modTime), "LastModified = %v", stat.LastModified)
 			assert.Equal(t, int64(42), stat.Size, "Size must come from the blob's Content-Length")
+			assert.Equal(t, `"e1"`, stat.ETag)
 		})
 	}
 }
@@ -1228,4 +1293,300 @@ func TestStorage_DeleteAll(t *testing.T) {
 		c.blobNames,
 		"every walked key must be deleted with the sub-storage prefix re-applied",
 	)
+}
+
+const testSrcURL = "https://acct.blob.core.windows.net/c/dumps/a.txt"
+
+// copySourceBlob returns a source double that reports testSrcURL.
+func copySourceBlob() *mockBlockBlob {
+	b := &mockBlockBlob{}
+	b.On("URL").Return(testSrcURL)
+	return b
+}
+
+// copyStatus builds a destination GetProperties answer for a copy in progress.
+func copyStatus(id string, status blob.CopyStatusType, description string) blob.GetPropertiesResponse {
+	return blob.GetPropertiesResponse{
+		CopyID:                to.Ptr(id),
+		CopyStatus:            to.Ptr(status),
+		CopyStatusDescription: to.Ptr(description),
+	}
+}
+
+// copied is a destination GetProperties answer for a finished copy.
+func copied(id string, size int64) blob.GetPropertiesResponse {
+	props := copyStatus(id, blob.CopyStatusTypeSuccess, "")
+	props.ContentLength = to.Ptr(size)
+	return props
+}
+
+func TestStorage_Copy(t *testing.T) {
+	tests := []struct {
+		name      string
+		startResp blob.StartCopyFromURLResponse
+		startErr  error
+		// polls are the destination GetProperties answers, in order.
+		polls     []blob.GetPropertiesResponse
+		wantBytes int64
+		wantErrIs error
+		wantErr   string
+	}{
+		// The copy response has no size, so one GetProperties follows.
+		{name: "a copy finished at once costs one lookup for its size",
+			startResp: blob.StartCopyFromURLResponse{CopyID: to.Ptr("c1"), CopyStatus: to.Ptr(blob.CopyStatusTypeSuccess)},
+			polls:     []blob.GetPropertiesResponse{copied("c1", 7)},
+			wantBytes: 7},
+		{name: "a pending copy is polled until it succeeds, and the last poll has the size",
+			startResp: blob.StartCopyFromURLResponse{CopyID: to.Ptr("c1"), CopyStatus: to.Ptr(blob.CopyStatusTypePending)},
+			polls: []blob.GetPropertiesResponse{
+				copyStatus("c1", blob.CopyStatusTypePending, ""),
+				copied("c1", 7),
+			},
+			wantBytes: 7},
+		{name: "a failed copy reports Azure's description",
+			startResp: blob.StartCopyFromURLResponse{CopyID: to.Ptr("c1"), CopyStatus: to.Ptr(blob.CopyStatusTypePending)},
+			polls:     []blob.GetPropertiesResponse{copyStatus("c1", blob.CopyStatusTypeFailed, "500 InternalError")},
+			wantErr:   "failed: 500 InternalError"},
+		{name: "a copy superseded at the destination is an error",
+			startResp: blob.StartCopyFromURLResponse{CopyID: to.Ptr("c1"), CopyStatus: to.Ptr(blob.CopyStatusTypePending)},
+			polls:     []blob.GetPropertiesResponse{copyStatus("c2", blob.CopyStatusTypeSuccess, "")},
+			wantErr:   "superseded"},
+		{name: "a poll without a copy status is an error, not an endless wait",
+			startResp: blob.StartCopyFromURLResponse{CopyID: to.Ptr("c1"), CopyStatus: to.Ptr(blob.CopyStatusTypePending)},
+			polls:     []blob.GetPropertiesResponse{{CopyID: to.Ptr("c1")}},
+			wantErr:   "reported no status"},
+		{name: "a missing source is ErrFileNotFound",
+			startErr: blobNotFound(), wantErrIs: storages.ErrFileNotFound},
+		{name: "a start failure is wrapped",
+			startErr: errors.New("boom"), wantErr: "azure object copying error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			src := copySourceBlob()
+			dst := &mockBlockBlob{}
+			dst.On("StartCopyFromURL", mock.Anything, testSrcURL, mock.Anything).Return(tt.startResp, tt.startErr)
+			for _, poll := range tt.polls {
+				dst.On("GetProperties", mock.Anything, mock.Anything).Return(poll, nil).Once()
+			}
+			c := &mockContainer{}
+			c.On("NewBlockBlobClient", "dumps/a.txt").Return(src)
+			c.On("NewBlockBlobClient", "dumps/b/c.txt").Return(dst)
+			st := newMockStorage(t, "dumps/", c)
+
+			// Act
+			stat, err := st.Copy(context.Background(), "a.txt", "b/c.txt")
+
+			// Assert
+			switch {
+			case tt.wantErrIs != nil:
+				require.ErrorIs(t, err, tt.wantErrIs)
+			case tt.wantErr != "":
+				require.ErrorContains(t, err, tt.wantErr)
+			default:
+				require.NoError(t, err)
+			}
+			assert.Equal(t, storages.CopyStat{Bytes: tt.wantBytes}, stat)
+			src.AssertExpectations(t)
+			dst.AssertExpectations(t)
+			src.AssertNotCalled(t, "GetProperties", mock.Anything, mock.Anything)
+		})
+	}
+}
+
+// refusals are Azure's answers declining to authorize a copy source.
+var refusals = map[string]func() error{
+	"CannotVerifyCopySource": func() error {
+		return &azcore.ResponseError{ErrorCode: string(bloberror.CannotVerifyCopySource)}
+	},
+	"AuthorizationFailure": func() error {
+		return &azcore.ResponseError{ErrorCode: string(bloberror.AuthorizationFailure)}
+	},
+	"AuthorizationPermissionMismatch": func() error {
+		return &azcore.ResponseError{ErrorCode: string(bloberror.AuthorizationPermissionMismatch)}
+	},
+}
+
+// TestStorage_Copy_RefusedWithoutFallbackIsAnError checks that a refused copy
+// is an error unless the client-side fallback was asked for.
+func TestStorage_Copy_RefusedWithoutFallbackIsAnError(t *testing.T) {
+	for name, refusal := range refusals {
+		t.Run(name, func(t *testing.T) {
+			src := copySourceBlob()
+			src.On("GetProperties", mock.Anything, mock.Anything).Return(blob.GetPropertiesResponse{}, nil)
+			dst := &mockBlockBlob{}
+			dst.On("StartCopyFromURL", mock.Anything, testSrcURL, mock.Anything).
+				Return(blob.StartCopyFromURLResponse{}, refusal())
+			c := &mockContainer{}
+			c.On("NewBlockBlobClient", "a.txt").Return(src)
+			c.On("NewBlockBlobClient", "b.txt").Return(dst)
+			st := newMockStorage(t, "", c)
+
+			_, err := st.Copy(context.Background(), "a.txt", "b.txt")
+
+			require.Error(t, err)
+			assert.True(t, bloberror.HasCode(err, bloberror.Code(name)), "the refusal must reach the caller: %v", err)
+			assert.NotErrorIs(t, err, storages.ErrFileNotFound, "an existing source must not read as missing")
+			src.AssertNotCalled(t, "DownloadStream", mock.Anything, mock.Anything)
+		})
+	}
+}
+
+// TestStorage_Copy_RefusedForAMissingSourceIsErrFileNotFound checks that a
+// refusal for a missing source is ErrFileNotFound.
+func TestStorage_Copy_RefusedForAMissingSourceIsErrFileNotFound(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallback=%v", fallback), func(t *testing.T) {
+			src := copySourceBlob()
+			src.On("GetProperties", mock.Anything, mock.Anything).Return(blob.GetPropertiesResponse{}, blobNotFound())
+			dst := &mockBlockBlob{}
+			dst.On("StartCopyFromURL", mock.Anything, testSrcURL, mock.Anything).
+				Return(blob.StartCopyFromURLResponse{}, refusals["CannotVerifyCopySource"]())
+			c := &mockContainer{}
+			c.On("NewBlockBlobClient", "a.txt").Return(src)
+			c.On("NewBlockBlobClient", "b.txt").Return(dst)
+			st := newMockStorage(t, "", c)
+
+			var opts []storages.CopyOption
+			if fallback {
+				opts = append(opts, storages.WithClientSideCopyFallback())
+			}
+			_, err := st.Copy(context.Background(), "a.txt", "b.txt", opts...)
+
+			require.ErrorIs(t, err, storages.ErrFileNotFound)
+			src.AssertNotCalled(t, "DownloadStream", mock.Anything, mock.Anything)
+			dst.AssertNotCalled(t, "UploadStream", mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
+}
+
+// TestStorage_Copy_FallbackStreams checks that, with the fallback asked for, a
+// refused copy of an existing source streams the blob, and the stat says so.
+func TestStorage_Copy_FallbackStreams(t *testing.T) {
+	for name, refusal := range refusals {
+		t.Run(name, func(t *testing.T) {
+			src := copySourceBlob()
+			src.On("GetProperties", mock.Anything, mock.Anything).Return(blob.GetPropertiesResponse{}, nil)
+			src.On("DownloadStream", mock.Anything, mock.Anything).Return(blob.DownloadStreamResponse{
+				DownloadResponse: blob.DownloadResponse{Body: io.NopCloser(strings.NewReader("payload"))},
+			}, nil).Once()
+			dst := &mockBlockBlob{}
+			dst.On("StartCopyFromURL", mock.Anything, testSrcURL, mock.Anything).
+				Return(blob.StartCopyFromURLResponse{}, refusal())
+			// UploadStream must drain the body for the bytes to be counted.
+			dst.On("UploadStream", mock.Anything, mock.Anything, mock.Anything).
+				Return(blockblob.UploadStreamResponse{}, nil).
+				Run(func(args mock.Arguments) { _, _ = io.Copy(io.Discard, args.Get(1).(io.Reader)) })
+			c := &mockContainer{}
+			c.On("NewBlockBlobClient", "dumps/a.txt").Return(src)
+			c.On("NewBlockBlobClient", "dumps/b.txt").Return(dst)
+			st := newMockStorage(t, "dumps/", c)
+
+			stat, err := st.Copy(context.Background(), "a.txt", "b.txt", storages.WithClientSideCopyFallback())
+
+			require.NoError(t, err)
+			assert.Equal(t, storages.CopyStat{Bytes: int64(len("payload")), Streamed: true}, stat)
+			src.AssertExpectations(t)
+			dst.AssertExpectations(t)
+		})
+	}
+}
+
+func TestStorage_Copy_OntoItself(t *testing.T) {
+	t.Run("an existing blob is left alone", func(t *testing.T) {
+		src := probeBlob(nil)
+		c := &mockContainer{}
+		c.On("NewBlockBlobClient", "dumps/a.txt").Return(src)
+		st := newMockStorage(t, "dumps/", c)
+
+		stat, err := st.Copy(context.Background(), "a.txt", "./a.txt")
+		require.NoError(t, err)
+		assert.Zero(t, stat, "a copy onto itself writes nothing")
+		src.AssertNotCalled(t, "StartCopyFromURL", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("a missing blob is ErrFileNotFound", func(t *testing.T) {
+		src := probeBlob(blobNotFound())
+		c := &mockContainer{}
+		c.On("NewBlockBlobClient", "dumps/a.txt").Return(src)
+		st := newMockStorage(t, "dumps/", c)
+
+		_, err := st.Copy(context.Background(), "a.txt", "a.txt")
+		require.ErrorIs(t, err, storages.ErrFileNotFound)
+	})
+}
+
+// TestStorage_Copy_PollFailureAbortsPendingCopy checks that a failed status
+// check, such as a transient 503, aborts the pending copy.
+func TestStorage_Copy_PollFailureAbortsPendingCopy(t *testing.T) {
+	pollErr := errors.New("503 server busy")
+	src := copySourceBlob()
+	dst := &mockBlockBlob{}
+	dst.On("StartCopyFromURL", mock.Anything, testSrcURL, mock.Anything).Return(
+		blob.StartCopyFromURLResponse{CopyID: to.Ptr("c1"), CopyStatus: to.Ptr(blob.CopyStatusTypePending)}, nil)
+	dst.On("GetProperties", mock.Anything, mock.Anything).Return(blob.GetPropertiesResponse{}, pollErr)
+	dst.On("AbortCopyFromURL", mock.Anything, "c1", mock.Anything).Return(blob.AbortCopyFromURLResponse{}, nil)
+	c := &mockContainer{}
+	c.On("NewBlockBlobClient", "a.txt").Return(src)
+	c.On("NewBlockBlobClient", "b.txt").Return(dst)
+	st := newMockStorage(t, "", c)
+
+	stat, err := st.Copy(context.Background(), "a.txt", "b.txt")
+
+	require.ErrorIs(t, err, pollErr)
+	assert.ErrorContains(t, err, "error checking copy status")
+	assert.Zero(t, stat)
+	dst.AssertCalled(t, "AbortCopyFromURL", mock.Anything, "c1", mock.Anything)
+}
+
+// TestStorage_Copy_CancelAbortsPendingCopy checks that cancelling a pending
+// copy, between polls or during one, aborts it.
+func TestStorage_Copy_CancelAbortsPendingCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		// duringPoll makes the status poll itself fail with the cancellation.
+		duringPoll bool
+	}{
+		{name: "cancelled between polls"},
+		{name: "cancelled during a poll", duringPoll: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			src := copySourceBlob()
+			dst := &mockBlockBlob{}
+			dst.On("StartCopyFromURL", mock.Anything, testSrcURL, mock.Anything).Return(
+				blob.StartCopyFromURLResponse{CopyID: to.Ptr("c1"), CopyStatus: to.Ptr(blob.CopyStatusTypePending)}, nil)
+			if tt.duringPoll {
+				dst.On("GetProperties", mock.Anything, mock.Anything).
+					Return(blob.GetPropertiesResponse{}, context.Canceled).
+					Run(func(mock.Arguments) { cancel() })
+			} else {
+				dst.On("GetProperties", mock.Anything, mock.Anything).
+					Return(copyStatus("c1", blob.CopyStatusTypePending, ""), nil).
+					Run(func(mock.Arguments) { cancel() })
+			}
+			dst.On("AbortCopyFromURL", mock.Anything, "c1", mock.Anything).Return(blob.AbortCopyFromURLResponse{}, nil)
+			c := &mockContainer{}
+			c.On("NewBlockBlobClient", "a.txt").Return(src)
+			c.On("NewBlockBlobClient", "b.txt").Return(dst)
+			st := newMockStorage(t, "", c)
+
+			_, err := st.Copy(ctx, "a.txt", "b.txt")
+
+			require.ErrorIs(t, err, context.Canceled)
+			dst.AssertCalled(t, "AbortCopyFromURL", mock.Anything, "c1", mock.Anything)
+		})
+	}
+}
+
+// TestEntityTag checks that a listing's bare ETag and a blob's quoted one come
+// out the same.
+func TestEntityTag(t *testing.T) {
+	assert.Equal(t, `"0x1E2"`, entityTag("0x1E2"))
+	assert.Equal(t, `"0x1E2"`, entityTag(`"0x1E2"`))
+	assert.Equal(t, `W/"0x1E2"`, entityTag(`W/"0x1E2"`))
 }

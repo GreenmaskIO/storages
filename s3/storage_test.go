@@ -28,6 +28,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,6 +58,9 @@ import (
 
 type mockS3 struct {
 	mock.Mock
+
+	// partCopyHook, when set, runs inside every UploadPartCopy call.
+	partCopyHook func()
 
 	// markers captures the Marker of each ListObjects (v1) call at call time.
 	// ListDir reuses and mutates a single input pointer across pages, so the
@@ -111,6 +115,87 @@ func (m *mockS3) DeleteObjects(
 	args := m.Called(ctx, in)
 	out, _ := args.Get(0).(*s3.DeleteObjectsOutput)
 	return out, args.Error(1)
+}
+
+func (m *mockS3) GetObjectTagging(
+	ctx context.Context, in *s3.GetObjectTaggingInput, _ ...func(*s3.Options),
+) (*s3.GetObjectTaggingOutput, error) {
+	args := m.Called(ctx, in)
+	out, _ := args.Get(0).(*s3.GetObjectTaggingOutput)
+	return out, args.Error(1)
+}
+
+func (m *mockS3) CopyObject(
+	ctx context.Context, in *s3.CopyObjectInput, _ ...func(*s3.Options),
+) (*s3.CopyObjectOutput, error) {
+	args := m.Called(ctx, in)
+	out, _ := args.Get(0).(*s3.CopyObjectOutput)
+	return out, args.Error(1)
+}
+
+func (m *mockS3) CreateMultipartUpload(
+	ctx context.Context, in *s3.CreateMultipartUploadInput, _ ...func(*s3.Options),
+) (*s3.CreateMultipartUploadOutput, error) {
+	args := m.Called(ctx, in)
+	out, _ := args.Get(0).(*s3.CreateMultipartUploadOutput)
+	return out, args.Error(1)
+}
+
+// UploadPartCopy derives a part's ETag from its number when no output is canned,
+// so part order can be checked.
+func (m *mockS3) UploadPartCopy(
+	ctx context.Context, in *s3.UploadPartCopyInput, _ ...func(*s3.Options),
+) (*s3.UploadPartCopyOutput, error) {
+	if m.partCopyHook != nil {
+		m.partCopyHook()
+	}
+	args := m.Called(ctx, in)
+	out, _ := args.Get(0).(*s3.UploadPartCopyOutput)
+	if out == nil && args.Error(1) == nil {
+		out = &s3.UploadPartCopyOutput{CopyPartResult: &types.CopyPartResult{
+			ETag: aws.String(fmt.Sprintf("etag-%d", aws.ToInt32(in.PartNumber))),
+		}}
+	}
+	return out, args.Error(1)
+}
+
+func (m *mockS3) CompleteMultipartUpload(
+	ctx context.Context, in *s3.CompleteMultipartUploadInput, _ ...func(*s3.Options),
+) (*s3.CompleteMultipartUploadOutput, error) {
+	args := m.Called(ctx, in)
+	out, _ := args.Get(0).(*s3.CompleteMultipartUploadOutput)
+	return out, args.Error(1)
+}
+
+func (m *mockS3) AbortMultipartUpload(
+	ctx context.Context, in *s3.AbortMultipartUploadInput, _ ...func(*s3.Options),
+) (*s3.AbortMultipartUploadOutput, error) {
+	args := m.Called(ctx, in)
+	out, _ := args.Get(0).(*s3.AbortMultipartUploadOutput)
+	return out, args.Error(1)
+}
+
+// partRanges returns the CopySourceRange of every UploadPartCopy call, keyed by
+// part number.
+func (m *mockS3) partRanges() map[int32]string {
+	ranges := map[int32]string{}
+	for _, c := range m.Calls {
+		if c.Method == "UploadPartCopy" {
+			in := c.Arguments.Get(1).(*s3.UploadPartCopyInput)
+			ranges[aws.ToInt32(in.PartNumber)] = aws.ToString(in.CopySourceRange)
+		}
+	}
+	return ranges
+}
+
+// lastCall returns the input argument of the most recent call to method, or nil.
+func (m *mockS3) lastCall(method string) any {
+	for i := len(m.Calls) - 1; i >= 0; i-- {
+		if m.Calls[i].Method == method {
+			return m.Calls[i].Arguments.Get(1)
+		}
+	}
+	return nil
 }
 
 // getKeys returns the Key of every GetObject call, in order.
@@ -646,7 +731,7 @@ func TestStorage_List(t *testing.T) {
 		svc := &mockS3{}
 		svc.On("ListObjectsV2", mock.Anything, noToken).Return(&s3.ListObjectsV2Output{
 			Contents: []types.Object{
-				{Key: aws.String("p/a.txt"), Size: aws.Int64(1), LastModified: aws.Time(modTime)},
+				{Key: aws.String("p/a.txt"), Size: aws.Int64(1), LastModified: aws.Time(modTime), ETag: aws.String(`"e1"`)},
 			},
 			IsTruncated:           aws.Bool(true),
 			NextContinuationToken: aws.String("token-1"),
@@ -669,6 +754,7 @@ func TestStorage_List(t *testing.T) {
 		assert.Equal(t, int64(1), objects[0].Size)
 		assert.True(t, objects[0].Exist)
 		assert.True(t, objects[0].LastModified.Equal(modTime))
+		assert.Equal(t, `"e1"`, objects[0].ETag)
 		assert.Equal(t, "dir/b.txt", objects[1].Name)
 		assert.Equal(t, int64(22), objects[1].Size)
 	})
@@ -837,7 +923,7 @@ func TestStorage_Stat(t *testing.T) {
 				svc.On("HeadObject", mock.Anything, mock.Anything).Return(nil, tt.headErr)
 			} else {
 				svc.On("HeadObject", mock.Anything, mock.Anything).
-					Return(&s3.HeadObjectOutput{LastModified: aws.Time(modTime), ContentLength: aws.Int64(42)}, nil)
+					Return(&s3.HeadObjectOutput{LastModified: aws.Time(modTime), ContentLength: aws.Int64(42), ETag: aws.String(`"e1"`)}, nil)
 			}
 			st := newStorage(t, tt.prefix, svc, nil)
 
@@ -861,6 +947,7 @@ func TestStorage_Stat(t *testing.T) {
 				return
 			}
 			assert.Equal(t, tt.wantName, stat.Name)
+			assert.Equal(t, `"e1"`, stat.ETag)
 			assert.True(t, stat.Exist)
 			assert.True(t, stat.LastModified.Equal(modTime), "LastModified = %v", stat.LastModified)
 			assert.Equal(t, int64(42), stat.Size, "Size must come from the HeadObject Content-Length")
@@ -1199,6 +1286,571 @@ func TestStorage_DeleteAll(t *testing.T) {
 		batches[0],
 		"every walked key must be deleted with the sub-storage prefix re-applied",
 	)
+}
+
+func TestStorage_Copy(t *testing.T) {
+	tests := []struct {
+		name      string
+		src, dst  string
+		headErr   error
+		copyErr   error
+		wantCopy  bool
+		wantErrIs error
+		wantErr   string
+	}{
+		{name: "copies with a single CopyObject", src: "a.txt", dst: "b/c.txt", wantCopy: true},
+		{name: "missing source is ErrFileNotFound and copies nothing", src: "a.txt", dst: "b.txt",
+			headErr: &types.NotFound{}, wantErrIs: storages.ErrFileNotFound},
+		{name: "head failure is wrapped", src: "a.txt", dst: "b.txt",
+			headErr: errors.New("boom"), wantErr: "error getting object info"},
+		{name: "a copy onto itself sends no copy", src: "a.txt", dst: "a.txt"},
+		{name: "a source vanishing before the copy is ErrFileNotFound", src: "a.txt", dst: "b.txt",
+			copyErr: &types.NoSuchKey{}, wantCopy: true, wantErrIs: storages.ErrFileNotFound},
+		{name: "copy failure is wrapped", src: "a.txt", dst: "b.txt",
+			copyErr: errors.New("boom"), wantCopy: true, wantErr: "s3 object copying error"},
+		{name: "a source overwritten after the HEAD is ErrSourceChanged", src: "a.txt", dst: "b.txt",
+			copyErr: apiErr(PreconditionFailedAwsErrorCode), wantCopy: true, wantErrIs: storages.ErrSourceChanged},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			svc := &mockS3{}
+			svc.On("HeadObject", mock.Anything, mock.Anything).
+				Return(&s3.HeadObjectOutput{ContentLength: aws.Int64(4), ETag: aws.String(`"v1"`)}, tt.headErr)
+			if tt.wantCopy {
+				svc.On("CopyObject", mock.Anything, mock.Anything).Return(&s3.CopyObjectOutput{}, tt.copyErr)
+			}
+			st := newStorage(t, "dumps/", svc, nil)
+
+			// Act
+			stat, err := st.Copy(context.Background(), tt.src, tt.dst)
+
+			// Assert
+			switch {
+			case tt.wantErrIs != nil:
+				require.ErrorIs(t, err, tt.wantErrIs)
+				assert.Zero(t, stat, "a failed copy reports nothing")
+			case tt.wantErr != "":
+				require.ErrorContains(t, err, tt.wantErr)
+				assert.Zero(t, stat, "a failed copy reports nothing")
+			case tt.src == tt.dst:
+				require.NoError(t, err)
+				assert.Zero(t, stat, "a copy onto itself writes nothing")
+			default:
+				require.NoError(t, err)
+				assert.Equal(t, storages.CopyStat{Bytes: 4}, stat, "the size comes from the HEAD; nothing was streamed")
+			}
+			svc.AssertExpectations(t)
+			assert.Equal(t, []string{"dumps/" + tt.src}, svc.headKeys())
+			if !tt.wantCopy {
+				svc.AssertNotCalled(t, "CopyObject", mock.Anything, mock.Anything)
+				return
+			}
+			in := svc.lastCall("CopyObject").(*s3.CopyObjectInput)
+			assert.Equal(t, "test-bucket", aws.ToString(in.Bucket))
+			assert.Equal(t, "test-bucket/dumps/"+tt.src, aws.ToString(in.CopySource))
+			assert.Equal(t, "dumps/"+tt.dst, aws.ToString(in.Key))
+			assert.Equal(t, types.StorageClass(defaultStorageClass), in.StorageClass)
+			assert.Equal(t, `"v1"`, aws.ToString(in.CopySourceIfMatch), "the copy is pinned to the version the HEAD saw")
+		})
+	}
+}
+
+// TestCopyAll_MoreThanOneListPage checks that CopyAll copies every key of a
+// multi-page listing exactly once.
+func TestCopyAll_MoreThanOneListPage(t *testing.T) {
+	const total = 2500
+	keys := make([]string, total)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("dumps/src/obj-%04d", i)
+	}
+	pages := [][]string{keys[:1000], keys[1000:2000], keys[2000:]}
+	objects := func(page []string) []types.Object {
+		res := make([]types.Object, len(page))
+		for i, k := range page {
+			res[i] = types.Object{Key: aws.String(k), Size: aws.Int64(3), ETag: aws.String(`"` + k + `"`)}
+		}
+		return res
+	}
+
+	for _, tc := range []struct {
+		name string
+		v1   bool
+	}{{name: "ListObjectsV2"}, {name: "ListObjects v1", v1: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			svc := &mockS3{}
+			if tc.v1 {
+				// NextMarker is left empty, as S3 leaves it without a delimiter.
+				for i, page := range pages {
+					marker := ""
+					if i > 0 {
+						marker = pages[i-1][len(pages[i-1])-1]
+					}
+					svc.On("ListObjects", mock.Anything, mock.MatchedBy(func(in *s3.ListObjectsInput) bool {
+						return aws.ToString(in.Prefix) == "dumps/src/" && aws.ToString(in.Marker) == marker
+					})).Return(&s3.ListObjectsOutput{
+						Contents:    objects(page),
+						IsTruncated: aws.Bool(i < len(pages)-1),
+					}, nil).Once()
+				}
+			} else {
+				for i, page := range pages {
+					token := ""
+					if i > 0 {
+						token = fmt.Sprintf("token-%d", i)
+					}
+					out := &s3.ListObjectsV2Output{Contents: objects(page), IsTruncated: aws.Bool(i < len(pages)-1)}
+					if i < len(pages)-1 {
+						out.NextContinuationToken = aws.String(fmt.Sprintf("token-%d", i+1))
+					}
+					svc.On("ListObjectsV2", mock.Anything, mock.MatchedBy(func(in *s3.ListObjectsV2Input) bool {
+						return aws.ToString(in.Prefix) == "dumps/src/" && aws.ToString(in.ContinuationToken) == token
+					})).Return(out, nil).Once()
+				}
+			}
+			svc.On("CopyObject", mock.Anything, mock.Anything).Return(&s3.CopyObjectOutput{}, nil)
+			st := newStorage(t, "dumps/", svc, nil)
+			st.config.UseListObjectsV1 = tc.v1
+
+			// Act
+			stat, err := st.CopyAll(context.Background(), "src", "dst",
+				storages.WithCopyAllObjectConcurrency(16))
+
+			// Assert
+			require.NoError(t, err)
+			svc.AssertExpectations(t)
+			assert.Equal(t, storages.CopyStat{Bytes: 3 * total, Objects: total}, stat)
+
+			var gotSrc, gotDst []string
+			for _, c := range svc.Calls {
+				if c.Method != "CopyObject" {
+					continue
+				}
+				in := c.Arguments.Get(1).(*s3.CopyObjectInput)
+				src := strings.TrimPrefix(aws.ToString(in.CopySource), "test-bucket/")
+				gotSrc = append(gotSrc, src)
+				gotDst = append(gotDst, aws.ToString(in.Key))
+				assert.Equal(t, `"`+src+`"`, aws.ToString(in.CopySourceIfMatch), "each copy is pinned to its listed ETag")
+			}
+			// Copies run concurrently, so compare as sets: every key exactly once.
+			wantDst := make([]string, total)
+			for i, k := range keys {
+				wantDst[i] = strings.Replace(k, "dumps/src/", "dumps/dst/", 1)
+			}
+			assert.ElementsMatch(t, keys, gotSrc, "every listed key is copied exactly once")
+			assert.ElementsMatch(t, wantDst, gotDst)
+			assert.Empty(t, svc.headKeys(), "the listing already gave size and ETag, so no HEAD is sent")
+		})
+	}
+}
+
+// TestStorage_copyListed checks that a listed object is copied without a HEAD
+// unless its listing is stale or not enough to copy it.
+func TestStorage_copyListed(t *testing.T) {
+	const listedETag, headETag = `"listed"`, `"current"`
+	listed := func(size int64) storages.ObjectStat {
+		return storages.ObjectStat{Name: "a.txt", Size: size, ETag: listedETag, Exist: true}
+	}
+	ifMatch := func(etag string) any {
+		return mock.MatchedBy(func(in *s3.CopyObjectInput) bool { return aws.ToString(in.CopySourceIfMatch) == etag })
+	}
+
+	t.Run("skips the HEAD and pins the copy to the listed ETag", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("CopyObject", mock.Anything, ifMatch(listedETag)).Return(&s3.CopyObjectOutput{}, nil)
+		st := newStorage(t, "dumps/", svc, nil)
+
+		// Act
+		stat, err := st.copyListed(context.Background(), listed(7), "a.txt", "b.txt")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Equal(t, storages.CopyStat{Bytes: 7}, stat, "the size comes from the listing")
+		assert.Empty(t, svc.headKeys())
+		svc.AssertExpectations(t)
+	})
+
+	t.Run("a stale listing falls back to the HEAD and copies the current version", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("CopyObject", mock.Anything, ifMatch(listedETag)).
+			Return(nil, apiErr(PreconditionFailedAwsErrorCode)).Once()
+		svc.On("HeadObject", mock.Anything, mock.Anything).
+			Return(&s3.HeadObjectOutput{ContentLength: aws.Int64(9), ETag: aws.String(headETag)}, nil)
+		svc.On("CopyObject", mock.Anything, ifMatch(headETag)).Return(&s3.CopyObjectOutput{}, nil).Once()
+		st := newStorage(t, "dumps/", svc, nil)
+
+		// Act
+		stat, err := st.copyListed(context.Background(), listed(7), "a.txt", "b.txt")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Equal(t, storages.CopyStat{Bytes: 9}, stat, "the size of the version actually copied")
+		assert.Equal(t, []string{"dumps/a.txt"}, svc.headKeys())
+		svc.AssertExpectations(t)
+	})
+
+	t.Run("a source deleted since the listing is ErrFileNotFound", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("CopyObject", mock.Anything, mock.Anything).Return(nil, &types.NoSuchKey{})
+		st := newStorage(t, "dumps/", svc, nil)
+
+		// Act
+		_, err := st.copyListed(context.Background(), listed(7), "a.txt", "b.txt")
+
+		// Assert
+		require.ErrorIs(t, err, storages.ErrFileNotFound)
+		assert.Empty(t, svc.headKeys())
+	})
+
+	for _, tc := range []struct {
+		name     string
+		obj      storages.ObjectStat
+		src, dst string
+	}{
+		{name: "a listing without an ETag takes the HEAD", obj: storages.ObjectStat{Name: "a.txt", Size: 7}, src: "a.txt", dst: "b.txt"},
+		{name: "a copy onto itself still checks the source exists", obj: listed(7), src: "a.txt", dst: "a.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Arrange
+			svc := &mockS3{}
+			svc.On("HeadObject", mock.Anything, mock.Anything).
+				Return(&s3.HeadObjectOutput{ContentLength: aws.Int64(9), ETag: aws.String(headETag)}, nil)
+			svc.On("CopyObject", mock.Anything, ifMatch(headETag)).Return(&s3.CopyObjectOutput{}, nil).Maybe()
+			st := newStorage(t, "dumps/", svc, nil)
+
+			// Act
+			_, err := st.copyListed(context.Background(), tc.obj, tc.src, tc.dst)
+
+			// Assert
+			require.NoError(t, err)
+			assert.Equal(t, []string{"dumps/a.txt"}, svc.headKeys())
+			svc.AssertNotCalled(t, "CopyObject", mock.Anything, ifMatch(listedETag))
+		})
+	}
+
+	t.Run("an object too large for CopyObject takes the HEAD for its headers", func(t *testing.T) {
+		// Arrange
+		svc := &mockS3{}
+		svc.On("HeadObject", mock.Anything, mock.Anything).Return(nil, errors.New("stop here"))
+		st := newStorage(t, "dumps/", svc, nil)
+
+		// Act
+		_, err := st.copyListed(context.Background(), listed(maxCopyObjectSize+1), "a.txt", "b.txt")
+
+		// Assert
+		require.ErrorContains(t, err, "stop here")
+		assert.Equal(t, []string{"dumps/a.txt"}, svc.headKeys(), "the multipart copy needs the HEAD's headers")
+		svc.AssertNotCalled(t, "CopyObject", mock.Anything, mock.Anything)
+	})
+}
+
+// TestStorage_Copy_Encryption checks that a copy carries the same SSE headers
+// PutObject does.
+func TestStorage_Copy_Encryption(t *testing.T) {
+	svc := &mockS3{}
+	svc.On("HeadObject", mock.Anything, mock.Anything).Return(&s3.HeadObjectOutput{ContentLength: aws.Int64(4)}, nil)
+	svc.On("CopyObject", mock.Anything, mock.Anything).Return(&s3.CopyObjectOutput{}, nil)
+	st := newStorage(t, "", svc, nil)
+	st.config.SSE = "aws:kms"
+	st.config.KMSKeyARN = testKMSKeyARN
+	st.config.BucketKeyEnabled = true
+
+	_, err := st.Copy(context.Background(), "a.txt", "b.txt")
+	require.NoError(t, err)
+
+	in := svc.lastCall("CopyObject").(*s3.CopyObjectInput)
+	assert.Equal(t, types.ServerSideEncryptionAwsKms, in.ServerSideEncryption)
+	assert.Equal(t, aws.String(testKMSKeyARN), in.SSEKMSKeyId)
+	assert.Equal(t, aws.Bool(true), in.BucketKeyEnabled)
+}
+
+// TestStorage_Copy_LargeObjectUsesMultipartCopy checks that Copy switches to a
+// multipart copy above 5 GiB, carrying content type and metadata.
+func TestStorage_Copy_LargeObjectUsesMultipartCopy(t *testing.T) {
+	const size = maxCopyObjectSize + 1
+	svc := &mockS3{}
+	svc.On("HeadObject", mock.Anything, mock.Anything).Return(&s3.HeadObjectOutput{
+		ContentLength: aws.Int64(size),
+		ETag:          aws.String(`"src-etag"`),
+		ContentType:   aws.String("application/x-tar"),
+		Metadata:      map[string]string{"k": "v"},
+	}, nil)
+	svc.On("CreateMultipartUpload", mock.Anything, mock.Anything).
+		Return(&s3.CreateMultipartUploadOutput{UploadId: aws.String("upload-1")}, nil)
+	svc.On("UploadPartCopy", mock.Anything, mock.Anything).Return(nil, nil)
+	svc.On("CompleteMultipartUpload", mock.Anything, mock.Anything).Return(&s3.CompleteMultipartUploadOutput{}, nil)
+	st := newStorage(t, "dumps/", svc, nil)
+	st.config.SSE = "AES256"
+
+	stat, err := st.Copy(context.Background(), "big.tar", "copy.tar")
+	require.NoError(t, err)
+
+	assert.Equal(t, storages.CopyStat{Bytes: size}, stat)
+	svc.AssertNotCalled(t, "CopyObject", mock.Anything, mock.Anything)
+	create := svc.lastCall("CreateMultipartUpload").(*s3.CreateMultipartUploadInput)
+	assert.Equal(t, "dumps/copy.tar", aws.ToString(create.Key))
+	assert.Equal(t, "application/x-tar", aws.ToString(create.ContentType))
+	assert.Equal(t, map[string]string{"k": "v"}, create.Metadata)
+	assert.Equal(t, types.ServerSideEncryptionAes256, create.ServerSideEncryption)
+
+	// 5 GiB + 1 byte in 512 MiB parts is ten full parts and a one-byte eleventh.
+	wantParts := int32((size + copyPartSize - 1) / copyPartSize)
+	ranges := svc.partRanges()
+	require.Len(t, ranges, int(wantParts))
+	assert.Equal(t, fmt.Sprintf("bytes=0-%d", copyPartSize-1), ranges[1])
+	assert.Equal(t, fmt.Sprintf("bytes=%d-%d", size-1, size-1), ranges[wantParts])
+
+	part := svc.lastCall("UploadPartCopy").(*s3.UploadPartCopyInput)
+	assert.Equal(t, "upload-1", aws.ToString(part.UploadId))
+	assert.Equal(t, "test-bucket/dumps/big.tar", aws.ToString(part.CopySource))
+	assert.Equal(t, `"src-etag"`, aws.ToString(part.CopySourceIfMatch), "every part is pinned to the source version")
+
+	complete := svc.lastCall("CompleteMultipartUpload").(*s3.CompleteMultipartUploadInput)
+	require.Len(t, complete.MultipartUpload.Parts, int(wantParts))
+	for i, p := range complete.MultipartUpload.Parts {
+		assert.Equal(t, int32(i+1), aws.ToInt32(p.PartNumber), "parts must be completed in order")
+		assert.Equal(t, fmt.Sprintf("etag-%d", i+1), aws.ToString(p.ETag))
+	}
+	svc.AssertNotCalled(t, "AbortMultipartUpload", mock.Anything, mock.Anything)
+}
+
+func TestStorage_multipartCopy_Ranges(t *testing.T) {
+	tests := []struct {
+		name       string
+		size       int64
+		partSize   int64
+		wantRanges map[int32]string
+		wantParts  int
+	}{
+		{name: "last part is short", size: 10, partSize: 4,
+			wantRanges: map[int32]string{1: "bytes=0-3", 2: "bytes=4-7", 3: "bytes=8-9"}},
+		{name: "exact multiple has no empty tail", size: 8, partSize: 4,
+			wantRanges: map[int32]string{1: "bytes=0-3", 2: "bytes=4-7"}},
+		{name: "part size grows to stay within 10000 parts", size: 30000, partSize: 1, wantParts: 10000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &mockS3{}
+			svc.On("CreateMultipartUpload", mock.Anything, mock.Anything).
+				Return(&s3.CreateMultipartUploadOutput{UploadId: aws.String("u")}, nil)
+			svc.On("UploadPartCopy", mock.Anything, mock.Anything).Return(nil, nil)
+			svc.On("CompleteMultipartUpload", mock.Anything, mock.Anything).Return(&s3.CompleteMultipartUploadOutput{}, nil)
+			st := newStorage(t, "", svc, nil)
+
+			head := &s3.HeadObjectOutput{ContentLength: aws.Int64(tt.size)}
+			require.NoError(t, st.multipartCopy(context.Background(), "src", "dst", head, tt.partSize, 5))
+
+			ranges := svc.partRanges()
+			if tt.wantRanges != nil {
+				assert.Equal(t, tt.wantRanges, ranges)
+			} else {
+				assert.Len(t, ranges, tt.wantParts)
+				assert.Equal(t, "bytes=0-2", ranges[1])
+			}
+		})
+	}
+}
+
+// TestStorage_multipartCopy_FailureAborts checks that a failed part aborts the
+// upload.
+func TestStorage_multipartCopy_FailureAborts(t *testing.T) {
+	tests := []struct {
+		name        string
+		partErr     error
+		completeErr error
+		wantErrIs   error
+		wantErr     string
+	}{
+		{name: "part failure", partErr: errors.New("boom"), wantErr: "error copying part"},
+		{name: "source deleted mid-copy", partErr: &types.NoSuchKey{}, wantErrIs: storages.ErrFileNotFound},
+		{name: "complete failure", completeErr: errors.New("boom"), wantErr: "error completing multipart copy"},
+		{name: "source overwritten mid-copy", partErr: apiErr(PreconditionFailedAwsErrorCode), wantErrIs: storages.ErrSourceChanged},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &mockS3{}
+			svc.On("CreateMultipartUpload", mock.Anything, mock.Anything).
+				Return(&s3.CreateMultipartUploadOutput{UploadId: aws.String("u")}, nil)
+			svc.On("UploadPartCopy", mock.Anything, mock.Anything).Return(nil, tt.partErr)
+			if tt.partErr == nil {
+				svc.On("CompleteMultipartUpload", mock.Anything, mock.Anything).
+					Return(&s3.CompleteMultipartUploadOutput{}, tt.completeErr)
+			}
+			svc.On("AbortMultipartUpload", mock.Anything, mock.Anything).Return(&s3.AbortMultipartUploadOutput{}, nil)
+			st := newStorage(t, "", svc, nil)
+
+			head := &s3.HeadObjectOutput{ContentLength: aws.Int64(100)}
+			err := st.multipartCopy(context.Background(), "src", "dst", head, 10, 5)
+
+			if tt.wantErrIs != nil {
+				require.ErrorIs(t, err, tt.wantErrIs)
+			} else {
+				require.ErrorContains(t, err, tt.wantErr)
+			}
+			abort := svc.lastCall("AbortMultipartUpload").(*s3.AbortMultipartUploadInput)
+			assert.Equal(t, "u", aws.ToString(abort.UploadId))
+			assert.Equal(t, "dst", aws.ToString(abort.Key))
+			if tt.partErr != nil {
+				svc.AssertNotCalled(t, "CompleteMultipartUpload", mock.Anything, mock.Anything)
+			}
+		})
+	}
+}
+
+// TestStorage_multipartCopy_CarriesHeadersAndTags checks that a multipart copy
+// carries over the headers and tags CopyObject would.
+func TestStorage_multipartCopy_CarriesHeadersAndTags(t *testing.T) {
+	expires := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	svc := &mockS3{}
+	svc.On("GetObjectTagging", mock.Anything, mock.Anything).Return(&s3.GetObjectTaggingOutput{
+		TagSet: []types.Tag{{Key: aws.String("team"), Value: aws.String("data eng")}, {Key: aws.String("tier"), Value: aws.String("cold")}},
+	}, nil)
+	svc.On("CreateMultipartUpload", mock.Anything, mock.Anything).
+		Return(&s3.CreateMultipartUploadOutput{UploadId: aws.String("u")}, nil)
+	svc.On("UploadPartCopy", mock.Anything, mock.Anything).Return(nil, nil)
+	svc.On("CompleteMultipartUpload", mock.Anything, mock.Anything).Return(&s3.CompleteMultipartUploadOutput{}, nil)
+	st := newStorage(t, "", svc, nil)
+
+	head := &s3.HeadObjectOutput{
+		ContentLength:      aws.Int64(10),
+		CacheControl:       aws.String("no-cache"),
+		ContentDisposition: aws.String("attachment"),
+		ContentEncoding:    aws.String("gzip"),
+		ContentLanguage:    aws.String("en"),
+		ContentType:        aws.String("application/gzip"),
+		Expires:            &expires,
+		Metadata:           map[string]string{"k": "v"},
+		TagCount:           aws.Int32(2),
+		VersionId:          aws.String("v1"),
+	}
+	require.NoError(t, st.multipartCopy(context.Background(), "src", "dst", head, 4, 5))
+
+	tagging := svc.lastCall("GetObjectTagging").(*s3.GetObjectTaggingInput)
+	assert.Equal(t, "v1", aws.ToString(tagging.VersionId), "tags are read from the version being copied")
+	create := svc.lastCall("CreateMultipartUpload").(*s3.CreateMultipartUploadInput)
+	assert.Equal(t, "no-cache", aws.ToString(create.CacheControl))
+	assert.Equal(t, "attachment", aws.ToString(create.ContentDisposition))
+	assert.Equal(t, "gzip", aws.ToString(create.ContentEncoding))
+	assert.Equal(t, "en", aws.ToString(create.ContentLanguage))
+	assert.Equal(t, "application/gzip", aws.ToString(create.ContentType))
+	assert.Equal(t, &expires, create.Expires)
+	assert.Equal(t, map[string]string{"k": "v"}, create.Metadata)
+	assert.Equal(t, "team=data%20eng&tier=cold", aws.ToString(create.Tagging))
+}
+
+// TestStorage_multipartCopy_UntaggedSkipsTagging checks that an untagged source
+// costs no GetObjectTagging request.
+func TestStorage_multipartCopy_UntaggedSkipsTagging(t *testing.T) {
+	svc := &mockS3{}
+	svc.On("CreateMultipartUpload", mock.Anything, mock.Anything).
+		Return(&s3.CreateMultipartUploadOutput{UploadId: aws.String("u")}, nil)
+	svc.On("UploadPartCopy", mock.Anything, mock.Anything).Return(nil, nil)
+	svc.On("CompleteMultipartUpload", mock.Anything, mock.Anything).Return(&s3.CompleteMultipartUploadOutput{}, nil)
+	st := newStorage(t, "", svc, nil)
+
+	head := &s3.HeadObjectOutput{ContentLength: aws.Int64(10)}
+	require.NoError(t, st.multipartCopy(context.Background(), "src", "dst", head, 4, 5))
+
+	svc.AssertNotCalled(t, "GetObjectTagging", mock.Anything, mock.Anything)
+	assert.Nil(t, svc.lastCall("CreateMultipartUpload").(*s3.CreateMultipartUploadInput).Tagging)
+}
+
+func TestStorage_copyConcurrency(t *testing.T) {
+	tests := []struct {
+		name   string
+		config int
+		opts   []storages.CopyOption
+		want   int
+	}{
+		{name: "sdk default when nothing is set", want: manager.DefaultUploadConcurrency},
+		{name: "config below the default is honored", config: 1, want: 1},
+		{name: "config above the default is honored", config: 16, want: 16},
+		{name: "the call option overrides the config", config: 16, opts: []storages.CopyOption{storages.WithCopyConcurrency(2)}, want: 2},
+		{name: "a non-positive option falls back to the config", config: 3, opts: []storages.CopyOption{storages.WithCopyConcurrency(0)}, want: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newStorage(t, "", nil, nil)
+			st.config.Concurrency = tt.config
+			assert.Equal(t, tt.want, st.copyConcurrency(storages.NewCopyOptions(tt.opts...)))
+		})
+	}
+}
+
+func Test_resolveCopyPartSize(t *testing.T) {
+	tests := []struct {
+		name string
+		opts []storages.CopyOption
+		want int64
+	}{
+		{name: "default", want: copyPartSize},
+		{name: "option within limits", opts: []storages.CopyOption{storages.WithCopyPartSize(64 << 20)}, want: 64 << 20},
+		{name: "below the S3 minimum is raised to it", opts: []storages.CopyOption{storages.WithCopyPartSize(1)}, want: manager.MinUploadPartSize},
+		{name: "above the S3 maximum is lowered to it", opts: []storages.CopyOption{storages.WithCopyPartSize(10 << 30)}, want: maxCopyPartSize},
+		{name: "non-positive keeps the default", opts: []storages.CopyOption{storages.WithCopyPartSize(-1)}, want: copyPartSize},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, resolveCopyPartSize(storages.NewCopyOptions(tt.opts...)))
+		})
+	}
+}
+
+// TestStorage_Copy_RespectsConcurrency checks that the resolved concurrency is a
+// hard cap on overlapping part copies.
+func TestStorage_Copy_RespectsConcurrency(t *testing.T) {
+	const size = maxCopyObjectSize + 1
+	var inFlight, peak atomic.Int32
+	svc := &mockS3{partCopyHook: func() {
+		n := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+		inFlight.Add(-1)
+	}}
+	svc.On("HeadObject", mock.Anything, mock.Anything).Return(&s3.HeadObjectOutput{ContentLength: aws.Int64(size)}, nil)
+	svc.On("CreateMultipartUpload", mock.Anything, mock.Anything).
+		Return(&s3.CreateMultipartUploadOutput{UploadId: aws.String("u")}, nil)
+	svc.On("UploadPartCopy", mock.Anything, mock.Anything).Return(nil, nil)
+	svc.On("CompleteMultipartUpload", mock.Anything, mock.Anything).Return(&s3.CompleteMultipartUploadOutput{}, nil)
+	st := newStorage(t, "", svc, nil)
+	st.config.Concurrency = 8
+
+	_, err := st.Copy(context.Background(), "src", "dst",
+		storages.WithCopyConcurrency(2), storages.WithCopyPartSize(256<<20))
+
+	require.NoError(t, err)
+	assert.Len(t, svc.partRanges(), int((size+(256<<20)-1)/(256<<20)), "the part size option must apply")
+	assert.LessOrEqual(t, peak.Load(), int32(2), "no more part copies may overlap than the option allows")
+	assert.Equal(t, int32(2), peak.Load(), "the allowed concurrency should actually be used")
+}
+
+func Test_copySource(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{key: "dumps/a.txt", want: "bucket/dumps/a.txt"},
+		{key: "with space/a b.txt", want: "bucket/with%20space/a%20b.txt"},
+		{key: "plus+sign.txt", want: "bucket/plus%2Bsign.txt"},
+		{key: "q?x#y%z.txt", want: "bucket/q%3Fx%23y%25z.txt"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			assert.Equal(t, tt.want, copySource("bucket", tt.key))
+		})
+	}
 }
 
 // The guard itself is tested once, in the root package, over a backend-agnostic

@@ -356,6 +356,105 @@ func TestStorage_Integration(t *testing.T) {
 		assert.Empty(t, files)
 	})
 
+	// 1100 objects crosses both the 1000-key list page and DeleteObjects batch
+	// limits.
+	t.Run("CopyAll and DeleteAll handle more than 1000 objects", func(t *testing.T) {
+		// Arrange
+		const total = 1100
+		st := mustSub(t, root, "it-copyall-many")
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 32)
+		errs := make(chan error, total)
+		for i := range total {
+			sem <- struct{}{}
+			wg.Go(func() {
+				defer func() { <-sem }()
+				errs <- st.PutObject(ctx, fmt.Sprintf("src/d%d/obj-%04d", i%7, i), bytes.NewReader([]byte("abc")))
+			})
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+
+		// Act
+		stat, err := st.CopyAll(ctx, "src", "dst", storages.WithCopyAllObjectConcurrency(32))
+
+		// Assert
+		require.NoError(t, err)
+		assert.Equal(t, storages.CopyStat{Bytes: 3 * total, Objects: total}, stat,
+			"every object copied, server-side")
+		src, err := st.List(ctx, "src")
+		require.NoError(t, err)
+		dst, err := st.List(ctx, "dst")
+		require.NoError(t, err)
+		require.Len(t, dst, total)
+		assert.Equal(t, objectNames(src), objectNames(dst))
+
+		require.NoError(t, st.DeleteAll(ctx, "dst"))
+		require.NoError(t, st.DeleteAll(ctx, "src"))
+		left, err := st.List(ctx, "")
+		require.NoError(t, err)
+		assert.Empty(t, left, "DeleteAll removed every batch")
+	})
+
+	// The S3 console creates zero-byte "dir/" keys for empty folders.
+	t.Run("CopyAll skips folder markers", func(t *testing.T) {
+		// Arrange
+		raw, err := rawClient(ctx, minioConfig.Endpoint, minioConfig.AccessKeyId, minioConfig.SecretAccessKey)
+		require.NoError(t, err)
+		st := mustSub(t, root, "it-copyall-markers")
+		require.NoError(t, st.PutObject(ctx, "src/a.txt", bytes.NewReader([]byte("a"))))
+		require.NoError(t, st.PutObject(ctx, "src/sub/b.txt", bytes.NewReader([]byte("bb"))))
+		for _, marker := range []string{"it-copyall-markers/src/sub/", "it-copyall-markers/src/empty/"} {
+			_, err := raw.PutObject(ctx, &awss3.PutObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(marker),
+				Body:   bytes.NewReader(nil),
+			})
+			require.NoError(t, err)
+		}
+		listed, err := st.List(ctx, "src")
+		require.NoError(t, err)
+		require.Contains(t, objectNames(listed), "empty/", "the server lists the marker, or this test proves nothing")
+
+		// Act
+		stat, err := st.CopyAll(ctx, "src", "dst")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Equal(t, storages.CopyStat{Bytes: 3, Objects: 2}, stat)
+		dst, err := st.List(ctx, "dst")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a.txt", "sub/b.txt"}, objectNames(dst))
+	})
+
+	// On an object store "b" and "b/..." coexist, so the object "b" lies beside
+	// the destination "b/", not under it, and has to be copied.
+	t.Run("CopyAll copies an object named like a nested destination", func(t *testing.T) {
+		// Arrange
+		st := mustSub(t, root, "it-copyall-samename")
+		require.NoError(t, st.PutObject(ctx, "b", bytes.NewReader([]byte("b"))))
+		require.NoError(t, st.PutObject(ctx, "c", bytes.NewReader([]byte("c"))))
+
+		// Act
+		stat, err := st.CopyAll(ctx, "", "b")
+
+		// Assert
+		require.NoError(t, err)
+		assert.Equal(t, 2, stat.Objects)
+		// MinIO hides "b/..." from listings while "b" exists, so read them back.
+		for key, want := range map[string]string{"b/b": "b", "b/c": "c"} {
+			r, err := st.GetObject(ctx, key)
+			require.NoError(t, err, key)
+			got, err := io.ReadAll(r)
+			require.NoError(t, r.Close())
+			require.NoError(t, err)
+			assert.Equal(t, want, string(got), key)
+		}
+	})
+
 	t.Run("Ping reaches the bucket", func(t *testing.T) {
 		// Act & Assert
 		assert.NoError(t, root.Ping(ctx))

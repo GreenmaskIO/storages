@@ -92,6 +92,15 @@ func TestGuard_ObjectMethodsRejectUnsafeKeys(t *testing.T) {
 			_, err := st.Stat(key)
 			return err
 		},
+		// Copy takes two keys, and each is gated on its own.
+		"CopySource": func(st storages.Storager, key string) error {
+			_, err := st.Copy(ctx, key, "copied.txt")
+			return err
+		},
+		"CopyDestination": func(st storages.Storager, key string) error {
+			_, err := st.Copy(ctx, "inside.txt", key)
+			return err
+		},
 	}
 
 	for name, call := range methods {
@@ -292,4 +301,73 @@ func names(objects []storages.ObjectStat) []string {
 // produce a nameless subtest.
 func quoted(key string) string {
 	return `"` + key + `"`
+}
+
+// optsRecorder records the copy options it receives.
+type optsRecorder struct {
+	storages.Storager
+	got storages.CopyOptions
+}
+
+func (r *optsRecorder) Copy(ctx context.Context, src, dst string, opts ...storages.CopyOption) (storages.CopyStat, error) {
+	r.got = storages.NewCopyOptions(opts...)
+	return r.Storager.Copy(ctx, src, dst, opts...)
+}
+
+// TestGuard_CopyPassesOptionsThrough checks that copy options reach the backend
+// untouched.
+func TestGuard_CopyPassesOptionsThrough(t *testing.T) {
+	ctx := context.Background()
+	rec := &optsRecorder{Storager: inmemory.New("/store", inmemory.WithUnsafe())}
+	require.NoError(t, rec.PutObject(ctx, "a.txt", strings.NewReader("a")))
+
+	_, err := storages.Guard(rec).Copy(ctx, "a.txt", "b.txt",
+		storages.WithCopyConcurrency(3), storages.WithCopyPartSize(64<<20))
+
+	require.NoError(t, err)
+	assert.Equal(t, storages.CopyOptions{Concurrency: 3, PartSize: 64 << 20}, rec.got)
+	assertContent(t, rec, "b.txt", "a")
+}
+
+// copyAllRecorder records what the backend's CopyAll receives.
+type copyAllRecorder struct {
+	storages.Storager
+	src, dst string
+	got      storages.CopyAllOptions
+}
+
+func (r *copyAllRecorder) CopyAll(
+	_ context.Context, srcPrefix, dstPrefix string, opts ...storages.CopyAllOption,
+) (storages.CopyStat, error) {
+	r.src, r.dst, r.got = srcPrefix, dstPrefix, storages.NewCopyAllOptions(opts...)
+	return storages.CopyStat{}, nil
+}
+
+// TestGuard_CopyAll checks that the guard hands the backend cleaned prefixes,
+// the root included, along with the options, and refuses escaping ones.
+func TestGuard_CopyAll(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ src, dst, wantSrc, wantDst string }{
+		{"./a/", "b//c", "a", "b/c"},
+		{"", "backup", "", "backup"},
+		{".", "a/../b", "", "b"},
+	} {
+		rec := &copyAllRecorder{Storager: inmemory.New("/store", inmemory.WithUnsafe())}
+
+		_, err := storages.Guard(rec).CopyAll(ctx, tc.src, tc.dst, storages.WithCopyAllObjectConcurrency(3))
+
+		require.NoError(t, err, "%q -> %q", tc.src, tc.dst)
+		assert.Equal(t, tc.wantSrc, rec.src)
+		assert.Equal(t, tc.wantDst, rec.dst)
+		assert.Equal(t, storages.CopyAllOptions{ObjectConcurrency: 3}, rec.got)
+	}
+
+	for _, tc := range []struct{ src, dst string }{{"../a", "b"}, {"a", "../b"}, {"/abs", "b"}, {"a", "/abs"}} {
+		rec := &copyAllRecorder{Storager: inmemory.New("/store", inmemory.WithUnsafe())}
+
+		_, err := storages.Guard(rec).CopyAll(ctx, tc.src, tc.dst)
+
+		assert.ErrorIs(t, err, storages.ErrUnsafeKey, "%q -> %q", tc.src, tc.dst)
+		assert.Empty(t, rec.src+rec.dst, "an escaping prefix never reaches the backend")
+	}
 }

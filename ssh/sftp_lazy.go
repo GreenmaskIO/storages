@@ -42,6 +42,8 @@ type SFTPClient interface {
 	Open(path string) (*sftp.File, error)
 	Create(path string) (*sftp.File, error)
 	MkdirAll(path string) error
+	Rename(oldname, newname string) error
+	PosixRename(oldname, newname string) error
 }
 
 // sftpLazy establishes the SSH/SFTP connection on the first Client() call and

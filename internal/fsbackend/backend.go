@@ -342,6 +342,127 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 	return nil
 }
 
+// Copy writes srcPath to a temporary file next to dstPath and renames it over
+// dstPath, so a failed copy leaves the destination as it was. Options are ignored.
+func (s *Storage) Copy(ctx context.Context, srcPath, dstPath string, _ ...storages.CopyOption) (storages.CopyStat, error) {
+	srcFull := path.Join(s.cwd, toSlash(srcPath))
+	dstFull := path.Join(s.cwd, toSlash(dstPath))
+	info, err := s.fs.Stat(native(srcFull))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return storages.CopyStat{}, storages.ErrFileNotFound
+	case err != nil:
+		return storages.CopyStat{}, fmt.Errorf("error checking %s: %w", srcPath, err)
+	case info.IsDir():
+		// A directory is not an object, as in Delete.
+		return storages.CopyStat{}, storages.ErrFileNotFound
+	}
+	same, err := s.sameFile(srcFull, dstFull, info)
+	if err != nil {
+		return storages.CopyStat{}, err
+	}
+	if same {
+		return storages.CopyStat{}, nil
+	}
+
+	src, err := s.fs.Open(native(srcFull))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return storages.CopyStat{}, storages.ErrFileNotFound
+		}
+		return storages.CopyStat{}, err
+	}
+
+	// The temporary sits next to dstFull so the rename stays on one filesystem.
+	dir := native(path.Dir(dstFull))
+	if err := s.fs.MkdirAll(dir, s.dirMode); err != nil {
+		s.closeQuietly(src, srcPath)
+		return storages.CopyStat{}, fmt.Errorf("error creating directory: %w", err)
+	}
+	tmp, err := afero.TempFile(s.fs, dir, ".copy-*")
+	if err != nil {
+		s.closeQuietly(src, srcPath)
+		return storages.CopyStat{}, fmt.Errorf("error creating temporary copy: %w", err)
+	}
+
+	n, err := s.fillAndRename(ctx, tmp, src, native(dstFull))
+	if err != nil {
+		s.removeQuietly(tmp.Name())
+		return storages.CopyStat{}, fmt.Errorf("error copying to %s: %w", dstPath, err)
+	}
+	return storages.CopyStat{Bytes: n}, nil
+}
+
+// fillAndRename copies src into tmp, closing both, and renames tmp onto dst.
+func (s *Storage) fillAndRename(ctx context.Context, tmp, src afero.File, dst string) (int64, error) {
+	n, err := s.writeAll(ctx, tmp, src)
+	if err != nil {
+		return 0, err
+	}
+	// afero.TempFile creates the file 0600.
+	if err := s.fs.Chmod(tmp.Name(), s.fileMode); err != nil {
+		return 0, fmt.Errorf("error setting file mode: %w", err)
+	}
+	if err := s.fs.Rename(tmp.Name(), dst); err != nil {
+		return 0, fmt.Errorf("error moving copy into place: %w", err)
+	}
+	return n, nil
+}
+
+// writeAll copies src into dst and closes both. A cancelled ctx closes src to
+// stop the copy, then waits for it, so dst is not in use once writeAll returns.
+func (s *Storage) writeAll(ctx context.Context, dst, src afero.File) (int64, error) {
+	type result struct {
+		n   int64
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := io.Copy(dst, src)
+		done <- result{n, err}
+	}()
+
+	var r result
+	select {
+	case r = <-done:
+		s.closeQuietly(src, src.Name())
+	case <-ctx.Done():
+		// Closing src, not dst: mem.File serializes Close against Read only.
+		s.closeQuietly(src, src.Name())
+		<-done
+		r = result{err: ctx.Err()}
+	}
+	if err := dst.Close(); err != nil && r.err == nil {
+		r.err = fmt.Errorf("error closing copy: %w", err)
+	}
+	return r.n, r.err
+}
+
+// removeQuietly removes a leftover temporary copy at the native path p.
+func (s *Storage) removeQuietly(p string) {
+	if err := s.fs.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) && s.logger != nil {
+		s.logger.Warn("error removing temporary copy", "path", p, "error", err)
+	}
+}
+
+// sameFile reports whether dstFull names the same file as srcInfo, including via
+// a symlink or case alias on OsFs. A directory at dstFull is an error.
+func (s *Storage) sameFile(srcFull, dstFull string, srcInfo fs.FileInfo) (bool, error) {
+	if srcFull == dstFull {
+		return true, nil
+	}
+	dstInfo, err := s.fs.Stat(native(dstFull))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("error checking %s: %w", dstFull, err)
+	case dstInfo.IsDir():
+		return false, fmt.Errorf("copy destination %s is a directory", dstFull)
+	}
+	return os.SameFile(srcInfo, dstInfo), nil
+}
+
 func (s *Storage) Delete(_ context.Context, filePaths ...string) error {
 	// Verify every path before removing anything, so a request naming one bad
 	// path leaves the storage untouched rather than partly deleted.
@@ -374,6 +495,13 @@ func (s *Storage) Delete(_ context.Context, filePaths ...string) error {
 		}
 	}
 	return nil
+}
+
+// CopyAll copies every object under srcPrefix to dstPrefix with storages.CopyEach.
+func (s *Storage) CopyAll(
+	ctx context.Context, srcPrefix, dstPrefix string, opts ...storages.CopyAllOption,
+) (storages.CopyStat, error) {
+	return storages.CopyEach(ctx, s, srcPrefix, dstPrefix, opts...)
 }
 
 func (s *Storage) DeleteAll(_ context.Context, pathPrefix string) error {

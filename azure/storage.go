@@ -18,6 +18,7 @@ package azure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -501,8 +502,10 @@ func (s *Storage) awaitCopy(
 				return none, s.abortCopy(ctx, dst, copyID)
 			}
 			// Abort so a Copy that reports failure does not still change dst.
-			_ = s.abortCopy(ctx, dst, copyID)
-			return none, fmt.Errorf("error checking copy status: %w", err)
+			return none, errors.Join(
+				fmt.Errorf("error checking copy status: %w", err),
+				s.abortCopy(ctx, dst, copyID),
+			)
 		}
 		// A different copy id means another write replaced the destination.
 		if props.CopyID == nil || *props.CopyID != copyID {

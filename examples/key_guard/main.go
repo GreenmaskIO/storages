@@ -49,7 +49,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() {
+		if err := os.RemoveAll(tmp); err != nil {
+			fmt.Fprintf(os.Stderr, "remove temp dir: %v\n", err)
+		}
+	}()
 
 	root := filepath.Join(tmp, "root")
 	if err := os.Mkdir(root, 0o755); err != nil {
@@ -66,7 +70,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer func() {
+		if err := st.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close guarded storage: %v\n", err)
+		}
+	}()
 
 	_, err = st.GetObject(ctx, key)
 	fmt.Printf("guarded  GetObject(%q): %v (ErrUnsafeKey: %t)\n",
@@ -77,13 +85,21 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer unsafe.Close()
+	defer func() {
+		if err := unsafe.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close unsafe storage: %v\n", err)
+		}
+	}()
 
 	r, err := unsafe.GetObject(ctx, key)
 	if err != nil {
 		return fmt.Errorf("unsafe GetObject: %w", err)
 	}
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close reader: %v\n", err)
+		}
+	}()
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err

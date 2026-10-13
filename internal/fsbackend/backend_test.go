@@ -19,8 +19,12 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -403,4 +407,106 @@ func TestPutObjectContextCancelled(t *testing.T) {
 		err := s.PutObject(ctx, "f.txt", r)
 		assert.ErrorIs(t, err, context.Canceled)
 	})
+}
+
+// TestCopyAppliesFileMode checks that a copy gets the configured file mode, not
+// the 0600 its temporary file is created with.
+func TestCopyAppliesFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows keeps only the write bit")
+	}
+	forEachBackend(t, func(t *testing.T, mk newStorage) {
+		s, cwd := mk(t)
+		put(t, s, "src.txt", "abc")
+
+		_, err := s.Copy(context.Background(), "src.txt", "dir/dst.txt")
+		require.NoError(t, err)
+
+		info, err := s.fs.Stat(native(path.Join(cwd, "dir/dst.txt")))
+		require.NoError(t, err)
+		assert.Equal(t, FileMode, info.Mode().Perm())
+	})
+}
+
+// blockingFs hands out files whose first Read blocks until the file is closed,
+// so a test can cancel a copy while it is in the middle of reading. It counts
+// the files opened for writing that are still open.
+type blockingFs struct {
+	afero.Fs
+	reading chan struct{}
+	writing atomic.Int32
+}
+
+func (b *blockingFs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
+	f, err := b.Fs.OpenFile(name, flag, perm)
+	if err != nil || flag&(os.O_WRONLY|os.O_RDWR) == 0 {
+		return f, err
+	}
+	b.writing.Add(1)
+	return &countedFile{File: f, open: &b.writing}, nil
+}
+
+type countedFile struct {
+	afero.File
+	open *atomic.Int32
+	once sync.Once
+}
+
+func (f *countedFile) Close() error {
+	f.once.Do(func() { f.open.Add(-1) })
+	return f.File.Close()
+}
+
+func (b *blockingFs) Open(name string) (afero.File, error) {
+	f, err := b.Fs.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &blockingFile{File: f, reading: b.reading, closed: make(chan struct{})}, nil
+}
+
+type blockingFile struct {
+	afero.File
+	reading   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (f *blockingFile) Read([]byte) (int, error) {
+	close(f.reading)
+	<-f.closed
+	return 0, afero.ErrFileClosed
+}
+
+func (f *blockingFile) Close() error {
+	f.closeOnce.Do(func() { close(f.closed) })
+	return f.File.Close()
+}
+
+// TestCopyCancelledMidCopyLeavesNoTemporary checks that cancelling a copy while
+// it is reading stops it and removes its temporary file before Copy returns.
+func TestCopyCancelledMidCopyLeavesNoTemporary(t *testing.T) {
+	fs := &blockingFs{Fs: afero.NewMemMapFs(), reading: make(chan struct{})}
+	require.NoError(t, fs.MkdirAll("/root", DirMode))
+	s := New(fs, "/root")
+	put(t, s, "src.txt", "abc")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := s.Copy(ctx, "src.txt", "dst.txt")
+		errc <- err
+	}()
+	<-fs.reading
+	cancel()
+
+	require.ErrorIs(t, <-errc, context.Canceled)
+	assert.Zero(t, fs.writing.Load(), "the temporary is closed before Copy returns, or Windows cannot remove it")
+	entries, err := afero.ReadDir(fs, "/root")
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.Equal(t, []string{"src.txt"}, names, "no temporary and no destination are left")
 }

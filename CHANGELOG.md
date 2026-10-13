@@ -8,6 +8,28 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
+## [0.3.3] - 2026-10-13
+
+### Added
+
+- `Storager.Copy` and `Storager.CopyAll` (via the new `Copier` interface) copy
+  an object or a whole prefix within a storage, server-side on s3 and azure.
+  See [docs/copy.md](docs/copy.md).
+- `storages.StreamCopy`, `CopyEach` and `CopyListed`, helpers that implement
+  `Copy` and `CopyAll` for other storages.
+- Copy options (`WithCopy*`, `WithCopyAll*`), `CopyStat`, and
+  `ErrSourceChanged` for an s3 source overwritten mid-copy.
+- `ObjectStat.ETag`, filled by s3 and azure.
+- `azure.Config.MaxRetries`, `CopyPollInterval` and `CopyPollMaxInterval`.
+
+### Changed
+
+- **Breaking:** `Storager` embeds `Copier`, so outside implementations must add
+  `Copy` and `CopyAll`; `StreamCopy` and `CopyEach` implement them.
+- `Storager` is split into `Reader`, `Writer`, `Deleter`, `Inspector`,
+  `Navigator` and `Copier`; the method set is otherwise unchanged.
+- New dependency: `golang.org/x/sync`.
+
 ## [0.3.2] - 2026-09-30
 
 ### Added

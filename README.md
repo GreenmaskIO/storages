@@ -49,26 +49,46 @@ err = st.PutObject(ctx, "reports/2023.txt", strings.NewReader("annual report"))
 files, err := storages.Walk(ctx, st)     // -> ["reports/2023.txt"]
 objects, err := st.List(ctx, "reports")  // -> [{Name: "2023.txt", Size: 13, ...}]
 chunk, err := st.GetObjectRange(ctx, "reports/2023.txt", 7, 6) // -> "report"
+stat, err := st.Copy(ctx, "reports/2023.txt", "archive/2023.txt") // server-side on S3/Azure; stat.Bytes == 13
+stat, err = st.CopyAll(ctx, "reports", "archive/reports") // every object under the prefix; stat.Objects == 1
 ```
 
 ```go
+// Storager, with its embedded interfaces expanded.
 type Storager interface {
+	// Reader
+	GetObject(ctx context.Context, filePath string) (io.ReadCloser, error)
+	GetObjectRange(ctx context.Context, filePath string, offset, length int64) (io.ReadCloser, error)
+
+	// Writer
+	PutObject(ctx context.Context, filePath string, body io.Reader) error
+
+	// Deleter
+	Delete(ctx context.Context, filePaths ...string) error
+	DeleteAll(ctx context.Context, pathPrefix string) error
+
+	// Inspector
+	List(ctx context.Context, prefix string) ([]ObjectStat, error)
+	Stat(fileName string) (*ObjectStat, error)
+	Exists(ctx context.Context, fileName string) (bool, error)
+
+	// Navigator
 	GetCwd() string
 	Dirname() string
 	ListDir(ctx context.Context) (files []string, dirs []Storager, err error)
-	List(ctx context.Context, prefix string) ([]ObjectStat, error)
-	GetObject(ctx context.Context, filePath string) (io.ReadCloser, error)
-	GetObjectRange(ctx context.Context, filePath string, offset, length int64) (io.ReadCloser, error)
-	PutObject(ctx context.Context, filePath string, body io.Reader) error
-	Delete(ctx context.Context, filePaths ...string) error
-	DeleteAll(ctx context.Context, pathPrefix string) error
-	Exists(ctx context.Context, fileName string) (bool, error)
 	SubStorage(subPath string, relative bool) (Storager, error)
-	Stat(fileName string) (*ObjectStat, error)
+
+	// Copier
+	Copy(ctx context.Context, srcPath, dstPath string, opts ...CopyOption) (CopyStat, error)
+	CopyAll(ctx context.Context, srcPrefix, dstPrefix string, opts ...CopyAllOption) (CopyStat, error)
+
 	Ping(ctx context.Context) error
 	Close() error
 }
 ```
+
+Code that needs only part of a storage can accept the small interface, such as
+`storages.Reader` for a restore or `storages.Writer` for an upload.
 
 Semantics, uniform across all backends:
 
@@ -90,6 +110,14 @@ Semantics, uniform across all backends:
 - `List` is flat and recursive: names relative to the prefix, slash-separated,
   sorted, each with `Size`. The prefix is directory-like, so `data` never matches
   `database`, and a prefix holding nothing is an empty slice with a nil error.
+- `Copy` copies an object to another key in the same storage, overwriting the
+  destination; a missing source is `storages.ErrFileNotFound`. It is
+  server-side on S3 and Azure, local on Directory and in-memory, and streamed
+  through the client over SSH.
+- `CopyAll` copies every object under a prefix to the same relative names
+  under another prefix, calling `Copy` per object. It is not atomic.
+
+  Backend behaviour, limitations and options: [docs/copy.md](docs/copy.md).
 
 ## Safety: the key guard
 
@@ -181,7 +209,14 @@ st := inmemory.New("")
 ## Writing your own backend
 
 Implement `Storager` and run the shared conformance suite against it
-(`storagetest` depends only on the standard library and `storages`):
+(`storagetest` depends only on the standard library and `storages`). If your
+storage has no native copy, implement `Copy` by calling
+`storages.StreamCopy(ctx, s, src, dst)`, which reads with `GetObject` and
+writes with `PutObject`. It suits storages where one file has no second name
+(symlinks, case-insensitive keys) and directories aren't objects. Implement
+`CopyAll` with `storages.CopyEach(ctx, s, srcPrefix, dstPrefix, opts...)`, or
+with `storages.CopyListed` if your per-object copy can use what `List` reported
+(the s3 backend uses each object's size and ETag to skip a HEAD):
 
 ```go
 func TestMyBackend(t *testing.T) {

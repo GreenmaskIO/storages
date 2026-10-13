@@ -291,6 +291,38 @@ func Run(t *testing.T, newStorage func(t *testing.T) storages.Storager) {
 		assertObjects(t, objects, map[string]int64{"one.txt": 1})
 	})
 
+	// A backend that reports an ETag reports the same one from List and Stat,
+	// and a new one once the object is overwritten.
+	t.Run("ETagAgreesAndChanges", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "dir/a.txt", "one")
+		listed, err := st.List(context.Background(), "dir")
+		if err != nil {
+			t.Fatalf("List(dir): %v", err)
+		}
+		if len(listed) != 1 {
+			t.Fatalf("List(dir) = %v, want one object", names(listed))
+		}
+		if listed[0].ETag == "" {
+			t.Skip("the backend reports no ETag")
+		}
+		stat, err := st.Stat("dir/a.txt")
+		if err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		if stat.ETag != listed[0].ETag {
+			t.Errorf("Stat ETag = %q, List ETag = %q, want them equal", stat.ETag, listed[0].ETag)
+		}
+		put(t, st, "dir/a.txt", "two")
+		again, err := st.Stat("dir/a.txt")
+		if err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		if again.ETag == stat.ETag {
+			t.Errorf("ETag after overwriting = %q, want it to change", again.ETag)
+		}
+	})
+
 	t.Run("ListAfterSubStorage", func(t *testing.T) {
 		st := newStorage(t)
 		sub := mustSub(t, st, "subdir")
@@ -435,6 +467,346 @@ func Run(t *testing.T, newStorage func(t *testing.T) storages.Storager) {
 		assertExists(t, st, "kept/a.txt", true)
 	})
 
+	t.Run("CopyRoundTrip", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src.txt", "payload")
+		stat, err := st.Copy(context.Background(), "src.txt", "nested/dir/dst.txt")
+		if err != nil {
+			t.Fatalf("Copy: %v", err)
+		}
+		if stat.Bytes != int64(len("payload")) {
+			t.Errorf("CopyStat.Bytes = %d, want %d", stat.Bytes, len("payload"))
+		}
+		if got := string(mustGet(t, st, "nested/dir/dst.txt")); got != "payload" {
+			t.Errorf("copy = %q, want %q", got, "payload")
+		}
+		if got := string(mustGet(t, st, "src.txt")); got != "payload" {
+			t.Errorf("source after copy = %q, want %q", got, "payload")
+		}
+	})
+
+	t.Run("CopyEmptyObject", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "empty.txt", "")
+		stat, err := st.Copy(context.Background(), "empty.txt", "empty-copy.txt")
+		if err != nil {
+			t.Fatalf("Copy: %v", err)
+		}
+		if stat.Bytes != 0 {
+			t.Errorf("CopyStat.Bytes = %d, want 0", stat.Bytes)
+		}
+		if got := mustGet(t, st, "empty-copy.txt"); len(got) != 0 {
+			t.Errorf("copy = %q, want empty", got)
+		}
+	})
+
+	t.Run("CopyOverwritesDestination", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src.txt", "new")
+		put(t, st, "dst.txt", "old and longer")
+		stat, err := st.Copy(context.Background(), "src.txt", "dst.txt")
+		if err != nil {
+			t.Fatalf("Copy: %v", err)
+		}
+		// The size of the copy, not of what it replaced.
+		if stat.Bytes != int64(len("new")) {
+			t.Errorf("CopyStat.Bytes = %d, want %d", stat.Bytes, len("new"))
+		}
+		if got := string(mustGet(t, st, "dst.txt")); got != "new" {
+			t.Errorf("copy = %q, want %q", got, "new")
+		}
+	})
+
+	// A hard link or reference would pass the round trip above but fail here.
+	t.Run("CopyIsIndependentOfSource", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src.txt", "original")
+		if _, err := st.Copy(context.Background(), "src.txt", "dst.txt"); err != nil {
+			t.Fatalf("Copy: %v", err)
+		}
+		put(t, st, "src.txt", "changed")
+		if got := string(mustGet(t, st, "dst.txt")); got != "original" {
+			t.Errorf("copy after overwriting the source = %q, want %q", got, "original")
+		}
+		if err := st.Delete(context.Background(), "src.txt"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if got := string(mustGet(t, st, "dst.txt")); got != "original" {
+			t.Errorf("copy after deleting the source = %q, want %q", got, "original")
+		}
+	})
+
+	t.Run("CopyOntoItselfIsANoop", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "same.txt", "keep me")
+		for _, dst := range []string{"same.txt", "./same.txt", "dir/../same.txt"} {
+			stat, err := st.Copy(context.Background(), "same.txt", dst)
+			if err != nil {
+				t.Errorf("Copy(same.txt, %q): %v", dst, err)
+			}
+			if stat.Bytes != 0 {
+				t.Errorf("Copy(same.txt, %q) CopyStat.Bytes = %d, want 0", dst, stat.Bytes)
+			}
+		}
+		if got := string(mustGet(t, st, "same.txt")); got != "keep me" {
+			t.Errorf("object after copying onto itself = %q, want %q", got, "keep me")
+		}
+	})
+
+	t.Run("CopyMissingSourceIsAnError", func(t *testing.T) {
+		st := newStorage(t)
+		_, err := st.Copy(context.Background(), "missing.txt", "dst.txt")
+		if !errors.Is(err, storages.ErrFileNotFound) {
+			t.Errorf("Copy(missing) error = %v, want ErrFileNotFound", err)
+		}
+		assertExists(t, st, "dst.txt", false)
+
+		// An object copied onto itself has to exist too.
+		_, err = st.Copy(context.Background(), "missing.txt", "missing.txt")
+		if !errors.Is(err, storages.ErrFileNotFound) {
+			t.Errorf("Copy(missing onto itself) error = %v, want ErrFileNotFound", err)
+		}
+	})
+
+	t.Run("CopyDirectoryIsAnError", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "dir/a.txt", "a")
+		_, err := st.Copy(context.Background(), "dir", "dir-copy")
+		if !errors.Is(err, storages.ErrFileNotFound) {
+			t.Errorf("Copy(directory) error = %v, want ErrFileNotFound", err)
+		}
+		assertExists(t, st, "dir-copy", false)
+	})
+
+	t.Run("CopyWithinSubStorage", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "sub/src.txt", "scoped")
+		sub := mustSub(t, st, "sub")
+		if _, err := sub.Copy(context.Background(), "src.txt", "dst.txt"); err != nil {
+			t.Fatalf("Copy: %v", err)
+		}
+		if got := string(mustGet(t, st, "sub/dst.txt")); got != "scoped" {
+			t.Errorf("copy = %q, want %q", got, "scoped")
+		}
+		assertExists(t, st, "dst.txt", false)
+	})
+
+	t.Run("CopyAllTree", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src/a.txt", "1")
+		put(t, st, "src/d/b.txt", "22")
+		put(t, st, "src/d/e/c.txt", "333")
+		stat, err := st.CopyAll(context.Background(), "src", "dst")
+		if err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if stat.Objects != 3 || stat.Bytes != 6 {
+			t.Errorf("CopyStat = %+v, want Objects 3, Bytes 6", stat)
+		}
+		objects, err := st.List(context.Background(), "dst")
+		if err != nil {
+			t.Fatalf("List(dst): %v", err)
+		}
+		assertObjects(t, objects, map[string]int64{"a.txt": 1, "d/b.txt": 2, "d/e/c.txt": 3})
+		for name, want := range map[string]string{"a.txt": "1", "d/b.txt": "22", "d/e/c.txt": "333"} {
+			if got := string(mustGet(t, st, "dst/"+name)); got != want {
+				t.Errorf("dst/%s = %q, want %q", name, got, want)
+			}
+			if got := string(mustGet(t, st, "src/"+name)); got != want {
+				t.Errorf("source src/%s after CopyAll = %q, want %q", name, got, want)
+			}
+		}
+	})
+
+	t.Run("CopyAllEmptyObjects", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src/empty.txt", "")
+		put(t, st, "src/d/empty.txt", "")
+		stat, err := st.CopyAll(context.Background(), "src", "dst")
+		if err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if stat.Objects != 2 || stat.Bytes != 0 {
+			t.Errorf("CopyStat = %+v, want Objects 2, Bytes 0", stat)
+		}
+		assertExists(t, st, "dst/empty.txt", true)
+		assertExists(t, st, "dst/d/empty.txt", true)
+	})
+
+	t.Run("CopyAllOverwritesDestination", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src/a.txt", "new")
+		put(t, st, "dst/a.txt", "old and longer")
+		put(t, st, "dst/unrelated.txt", "stays")
+		if _, err := st.CopyAll(context.Background(), "src", "dst"); err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if got := string(mustGet(t, st, "dst/a.txt")); got != "new" {
+			t.Errorf("dst/a.txt = %q, want %q", got, "new")
+		}
+		if got := string(mustGet(t, st, "dst/unrelated.txt")); got != "stays" {
+			t.Errorf("dst/unrelated.txt = %q, want %q", got, "stays")
+		}
+	})
+
+	t.Run("CopyAllPrefixIsolation", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "data/one.txt", "1")
+		put(t, st, "database/two.txt", "22")
+		stat, err := st.CopyAll(context.Background(), "data", "copy")
+		if err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if stat.Objects != 1 {
+			t.Errorf("CopyStat.Objects = %d, want 1", stat.Objects)
+		}
+		objects, err := st.List(context.Background(), "copy")
+		if err != nil {
+			t.Fatalf("List(copy): %v", err)
+		}
+		// The "data" prefix is directory-like, so it must not swallow "database".
+		assertObjects(t, objects, map[string]int64{"one.txt": 1})
+	})
+
+	t.Run("CopyAllMissingPrefixIsAnError", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "kept/a.txt", "a")
+		// A prefix naming an object rather than a directory holds nothing either.
+		put(t, st, "file.txt", "f")
+		for _, prefix := range []string{"never_existed", "file.txt"} {
+			stat, err := st.CopyAll(context.Background(), prefix, "dst")
+			if !errors.Is(err, storages.ErrFileNotFound) {
+				t.Errorf("CopyAll(%q) error = %v, want ErrFileNotFound", prefix, err)
+			}
+			if stat != (storages.CopyStat{}) {
+				t.Errorf("CopyAll(%q) CopyStat = %+v, want zero", prefix, stat)
+			}
+		}
+		objects, err := st.List(context.Background(), "dst")
+		if err != nil {
+			t.Fatalf("List(dst): %v", err)
+		}
+		if len(objects) != 0 {
+			t.Errorf("a failed CopyAll wrote %v", names(objects))
+		}
+	})
+
+	t.Run("CopyAllOntoItself", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src/a.txt", "keep me")
+		put(t, st, "src/d/b.txt", "me too")
+		if _, err := st.CopyAll(context.Background(), "src", "src"); err != nil {
+			t.Fatalf("CopyAll onto itself: %v", err)
+		}
+		if got := string(mustGet(t, st, "src/a.txt")); got != "keep me" {
+			t.Errorf("src/a.txt = %q, want %q", got, "keep me")
+		}
+		if got := string(mustGet(t, st, "src/d/b.txt")); got != "me too" {
+			t.Errorf("src/d/b.txt = %q, want %q", got, "me too")
+		}
+	})
+
+	t.Run("CopyAllIntoOwnSubtree", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "a/x.txt", "x")
+		put(t, st, "a/d/y.txt", "yy")
+		stat, err := st.CopyAll(context.Background(), "a", "a/b")
+		if err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if stat.Objects != 2 {
+			t.Errorf("CopyStat.Objects = %d, want 2", stat.Objects)
+		}
+		objects, err := st.List(context.Background(), "a")
+		if err != nil {
+			t.Fatalf("List(a): %v", err)
+		}
+		assertObjects(t, objects, map[string]int64{"x.txt": 1, "d/y.txt": 2, "b/x.txt": 1, "b/d/y.txt": 2})
+	})
+
+	t.Run("CopyAllIntoOwnSubtreeLeavesOutTheDestination", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "a/x.txt", "new")
+		put(t, st, "a/b/x.txt", "old")
+		put(t, st, "a/b/kept.txt", "kept")
+		stat, err := st.CopyAll(context.Background(), "a", "a/b")
+		if err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if stat.Objects != 1 {
+			t.Errorf("CopyStat.Objects = %d, want 1", stat.Objects)
+		}
+		objects, err := st.List(context.Background(), "a")
+		if err != nil {
+			t.Fatalf("List(a): %v", err)
+		}
+		assertObjects(t, objects, map[string]int64{"x.txt": 3, "b/x.txt": 3, "b/kept.txt": 4})
+		if got := string(mustGet(t, st, "a/b/x.txt")); got != "new" {
+			t.Errorf("a/b/x.txt = %q, want %q", got, "new")
+		}
+	})
+
+	t.Run("CopyAllFromRoot", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "x.txt", "x")
+		put(t, st, "d/y.txt", "yy")
+		stat, err := st.CopyAll(context.Background(), "", "backup")
+		if err != nil {
+			t.Fatalf("CopyAll from the root: %v", err)
+		}
+		if stat.Objects != 2 {
+			t.Errorf("CopyStat.Objects = %d, want 2", stat.Objects)
+		}
+		objects, err := st.List(context.Background(), "")
+		if err != nil {
+			t.Fatalf("List(root): %v", err)
+		}
+		assertObjects(t, objects, map[string]int64{"x.txt": 1, "d/y.txt": 2, "backup/x.txt": 1, "backup/d/y.txt": 2})
+	})
+
+	t.Run("CopyAllIsIndependentOfSource", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src/a.txt", "original")
+		if _, err := st.CopyAll(context.Background(), "src", "dst"); err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if err := st.DeleteAll(context.Background(), "src"); err != nil {
+			t.Fatalf("DeleteAll(src): %v", err)
+		}
+		if got := string(mustGet(t, st, "dst/a.txt")); got != "original" {
+			t.Errorf("copy after deleting the source = %q, want %q", got, "original")
+		}
+	})
+
+	t.Run("CopyAllWithinSubStorage", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "sub/src/a.txt", "scoped")
+		put(t, st, "src/a.txt", "outside")
+		sub := mustSub(t, st, "sub")
+		if _, err := sub.CopyAll(context.Background(), "src", "dst"); err != nil {
+			t.Fatalf("CopyAll: %v", err)
+		}
+		if got := string(mustGet(t, st, "sub/dst/a.txt")); got != "scoped" {
+			t.Errorf("copy = %q, want %q", got, "scoped")
+		}
+		assertExists(t, st, "dst/a.txt", false)
+	})
+
+	t.Run("CopyAllGuardRejectsEscapingPrefixes", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "src/a.txt", "a")
+		for _, tc := range []struct{ src, dst string }{
+			{"../src", "dst"},
+			{"src", "../dst"},
+			{"src", "dst/../../dst"},
+		} {
+			if _, err := st.CopyAll(context.Background(), tc.src, tc.dst); !errors.Is(err, storages.ErrUnsafeKey) {
+				t.Errorf("CopyAll(%q, %q) error = %v, want ErrUnsafeKey", tc.src, tc.dst, err)
+			}
+		}
+		assertExists(t, st, "dst/a.txt", false)
+	})
+
 	// A key that walks out of the storage is refused before it reaches the
 	// backend, so untrusted input cannot address a neighbour of the storage.
 	t.Run("GuardRejectsEscapingKeys", func(t *testing.T) {
@@ -450,6 +822,17 @@ func Run(t *testing.T, newStorage func(t *testing.T) storages.Storager) {
 				t.Errorf("Exists(%q) error = %v, want ErrUnsafeKey", key, err)
 			}
 		}
+
+		put(t, st, "inside.txt", "x")
+		for _, key := range []string{"../escape.txt", "a/../../escape.txt", "/absolute.txt"} {
+			if _, err := st.Copy(context.Background(), key, "copy.txt"); !errors.Is(err, storages.ErrUnsafeKey) {
+				t.Errorf("Copy(%q, copy.txt) error = %v, want ErrUnsafeKey", key, err)
+			}
+			if _, err := st.Copy(context.Background(), "inside.txt", key); !errors.Is(err, storages.ErrUnsafeKey) {
+				t.Errorf("Copy(inside.txt, %q) error = %v, want ErrUnsafeKey", key, err)
+			}
+		}
+		assertExists(t, st, "copy.txt", false)
 	})
 
 	// The storage root is not an object key. It matters most for DeleteAll,
@@ -464,6 +847,9 @@ func Run(t *testing.T, newStorage func(t *testing.T) storages.Storager) {
 			}
 			if _, err := st.Stat(key); !errors.Is(err, storages.ErrUnsafeKey) {
 				t.Errorf("Stat(%q) error = %v, want ErrUnsafeKey", key, err)
+			}
+			if _, err := st.Copy(context.Background(), "kept.txt", key); !errors.Is(err, storages.ErrUnsafeKey) {
+				t.Errorf("Copy(kept.txt, %q) error = %v, want ErrUnsafeKey", key, err)
 			}
 		}
 		assertExists(t, st, "kept.txt", true)

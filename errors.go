@@ -35,6 +35,10 @@ var ErrInvalidRange = errors.New("invalid byte range")
 // object key.
 var ErrUnsafeKey = errors.New("unsafe storage key")
 
+// ErrSourceChanged reports an s3 copy abandoned because its source was
+// overwritten mid-copy. The destination is untouched; a retry copies the new version.
+var ErrSourceChanged = errors.New("copy source changed during copy")
+
 // MissingObjectsError is returned by Delete and DeleteAll when some of the
 // requested paths are not existing objects — either absent, or (for Delete) a
 // directory rather than an object. Nothing was deleted: both operations verify

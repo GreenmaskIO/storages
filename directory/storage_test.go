@@ -67,6 +67,116 @@ func TestWithUnsafeReachesOutsideTheDirectory(t *testing.T) {
 	assert.Equal(t, "SECRET", string(content))
 }
 
+// TestCopyOntoAnotherNameForTheSource checks that copying onto a symlink or case
+// alias of the source does not truncate it.
+func TestCopyOntoAnotherNameForTheSource(t *testing.T) {
+	ctx := context.Background()
+
+	readFile := func(t *testing.T, st storages.Storager, key string) string {
+		t.Helper()
+		r, err := st.GetObject(ctx, key)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, r.Close()) }()
+		content, err := io.ReadAll(r)
+		require.NoError(t, err)
+		return string(content)
+	}
+
+	t.Run("symlink", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "src.txt"), []byte("keep me"), 0o600))
+		if err := os.Symlink(filepath.Join(root, "src.txt"), filepath.Join(root, "link.txt")); err != nil {
+			t.Skipf("cannot create a symlink here: %v", err)
+		}
+		st, err := NewStorage(Config{RootPath: root})
+		require.NoError(t, err)
+
+		_, err = st.Copy(ctx, "src.txt", "link.txt")
+		require.NoError(t, err)
+
+		assert.Equal(t, "keep me", readFile(t, st, "src.txt"))
+	})
+
+	t.Run("different case", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "data.bin"), []byte("keep me"), 0o600))
+		if _, err := os.Stat(filepath.Join(root, "DATA.bin")); err != nil {
+			t.Skip("the filesystem is case-sensitive, so the keys name two files")
+		}
+		st, err := NewStorage(Config{RootPath: root})
+		require.NoError(t, err)
+
+		_, err = st.Copy(ctx, "data.bin", "DATA.bin")
+		require.NoError(t, err)
+
+		assert.Equal(t, "keep me", readFile(t, st, "data.bin"))
+	})
+}
+
+func TestCopyIntoPlace(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("leaves no temporary behind", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "src.txt"), []byte("new"), 0o600))
+		mkdirs(t, root, "dir")
+		mkfile(t, root, "dir/dst.txt")
+		st, err := NewStorage(Config{RootPath: root})
+		require.NoError(t, err)
+
+		stat, err := st.Copy(ctx, "src.txt", "dir/dst.txt")
+		require.NoError(t, err)
+
+		assert.Equal(t, storages.CopyStat{Bytes: 3}, stat)
+		entries, err := os.ReadDir(filepath.Join(root, "dir"))
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		assert.Equal(t, "dst.txt", entries[0].Name())
+	})
+
+	// An unguarded storage passes keys uncleaned; the temporary must still land
+	// next to the cleaned destination.
+	t.Run("an uncleaned destination key", func(t *testing.T) {
+		for _, dst := range []string{"dir/dst.txt/", "dir/sub/../dst.txt", "dir//dst.txt"} {
+			t.Run(dst, func(t *testing.T) {
+				root := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(root, "src.txt"), []byte("new"), 0o600))
+				mkdirs(t, root, "dir")
+				st, err := NewStorage(Config{RootPath: root}, WithUnsafe())
+				require.NoError(t, err)
+
+				stat, err := st.Copy(ctx, "src.txt", dst)
+				require.NoError(t, err)
+
+				assert.Equal(t, storages.CopyStat{Bytes: 3}, stat)
+				got, err := os.ReadFile(filepath.Join(root, "dir", "dst.txt"))
+				require.NoError(t, err)
+				assert.Equal(t, "new", string(got))
+				entries, err := os.ReadDir(filepath.Join(root, "dir"))
+				require.NoError(t, err)
+				require.Len(t, entries, 1, "no temporary or stray directory is left behind")
+				assert.Equal(t, "dst.txt", entries[0].Name())
+				assert.False(t, entries[0].IsDir())
+			})
+		}
+	})
+
+	t.Run("a directory destination is an error and stays in place", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "src.txt"), []byte("src"), 0o600))
+		mkdirs(t, root, "dir")
+		mkfile(t, root, "dir/a.txt")
+		st, err := NewStorage(Config{RootPath: root})
+		require.NoError(t, err)
+
+		_, err = st.Copy(ctx, "src.txt", "dir")
+		require.ErrorContains(t, err, "is a directory")
+
+		_, err = os.Stat(filepath.Join(root, "dir", "a.txt"))
+		assert.NoError(t, err)
+	})
+}
+
 // mkdirs creates each slash-separated path under base, as a directory.
 func mkdirs(t *testing.T, base string, paths ...string) {
 	t.Helper()

@@ -18,7 +18,6 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
@@ -129,17 +128,33 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// applyEncryption sets the server-side encryption headers on an upload.
-// Validate guarantees the KMS-only options are set only with a KMS-backed mode.
-func (c *Config) applyEncryption(in *s3.PutObjectInput) {
+// encryption is the set of server-side encryption headers every object-creating
+// request carries.
+type encryption struct {
+	sse       types.ServerSideEncryption
+	kmsKeyID  *string
+	bucketKey *bool
+}
+
+// encryption returns the headers for the configured SSE mode; with none set,
+// all are empty and the bucket default applies.
+func (c *Config) encryption() encryption {
+	var e encryption
 	if c.SSE == "" {
-		return
+		return e
 	}
-	in.ServerSideEncryption = types.ServerSideEncryption(c.SSE)
+	e.sse = types.ServerSideEncryption(c.SSE)
 	if c.KMSKeyARN != "" {
-		in.SSEKMSKeyId = aws.String(c.KMSKeyARN)
+		e.kmsKeyID = aws.String(c.KMSKeyARN)
 	}
 	if c.BucketKeyEnabled {
-		in.BucketKeyEnabled = aws.Bool(true)
+		e.bucketKey = aws.Bool(true)
 	}
+	return e
+}
+
+// apply writes the headers onto an input's fields, passed by address since each
+// operation declares them on its own type.
+func (e encryption) apply(sse *types.ServerSideEncryption, kmsKeyID **string, bucketKey **bool) {
+	*sse, *kmsKeyID, *bucketKey = e.sse, e.kmsKeyID, e.bucketKey
 }

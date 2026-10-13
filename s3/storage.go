@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -38,6 +39,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/greenmaskio/storages"
 )
@@ -52,9 +54,20 @@ const DefaultS3ObjectsDelimiter = "/"
 const deleteObjectsBatchSize = 1000
 
 const (
-	NotFountAwsErrorCode     = "NotFound"
-	NoSuchKeyAwsErrorCode    = "NoSuchKey"
-	InvalidRangeAwsErrorCode = "InvalidRange"
+	// maxCopyObjectSize is the largest object a single CopyObject can copy.
+	maxCopyObjectSize = 5 << 30
+	// copyPartSize is the default UploadPartCopy range; large parts keep the
+	// request count low since the bytes never leave S3.
+	copyPartSize = 512 << 20
+	// maxCopyPartSize is the largest range one UploadPartCopy may cover.
+	maxCopyPartSize = 5 << 30
+)
+
+const (
+	NotFountAwsErrorCode           = "NotFound"
+	NoSuchKeyAwsErrorCode          = "NoSuchKey"
+	InvalidRangeAwsErrorCode       = "InvalidRange"
+	PreconditionFailedAwsErrorCode = "PreconditionFailed"
 )
 
 // s3API is the narrow set of S3 operations Storage depends on. v2 dropped the
@@ -68,6 +81,12 @@ type s3API interface {
 	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	HeadBucket(context.Context, *s3.HeadBucketInput, ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
 	DeleteObjects(context.Context, *s3.DeleteObjectsInput, ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
+	GetObjectTagging(context.Context, *s3.GetObjectTaggingInput, ...func(*s3.Options)) (*s3.GetObjectTaggingOutput, error)
+	CopyObject(context.Context, *s3.CopyObjectInput, ...func(*s3.Options)) (*s3.CopyObjectOutput, error)
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPartCopy(context.Context, *s3.UploadPartCopyInput, ...func(*s3.Options)) (*s3.UploadPartCopyOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
 }
 
 // uploaderAPI is the multipart-upload surface Storage depends on, satisfied by
@@ -397,6 +416,7 @@ func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectSta
 				LastModified: aws.ToTime(object.LastModified),
 				Exist:        true,
 				Size:         aws.ToInt64(object.Size),
+				ETag:         aws.ToString(object.ETag),
 			})
 		}
 	}
@@ -455,12 +475,239 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 		StorageClass: types.StorageClass(s.config.StorageClass),
 	}
 
-	s.config.applyEncryption(ui)
+	s.config.encryption().apply(&ui.ServerSideEncryption, &ui.SSEKMSKeyId, &ui.BucketKeyEnabled)
 
 	if _, err := s.uploader.Upload(ctx, ui); err != nil {
 		return fmt.Errorf("s3 object uploading error: %w", err)
 	}
 	return nil
+}
+
+// Copy copies srcPath to dstPath server-side: one CopyObject up to 5 GiB, a
+// multipart UploadPartCopy above. The copy gets the configured storage class and
+// SSE, not the source's; a source overwritten mid-copy fails with ErrSourceChanged.
+func (s *Storage) Copy(
+	ctx context.Context, srcPath, dstPath string, opts ...storages.CopyOption,
+) (storages.CopyStat, error) {
+	srcKey := path.Join(s.prefix, srcPath)
+	dstKey := path.Join(s.prefix, dstPath)
+
+	head, err := s.service.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.config.Bucket),
+		Key:    aws.String(srcKey),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return storages.CopyStat{}, storages.ErrFileNotFound
+		}
+		return storages.CopyStat{}, fmt.Errorf("error getting object info: %w", err)
+	}
+	// S3 refuses a copy onto itself that changes nothing.
+	if srcKey == dstKey {
+		return storages.CopyStat{}, nil
+	}
+	stat := storages.CopyStat{Bytes: aws.ToInt64(head.ContentLength)}
+
+	if stat.Bytes > maxCopyObjectSize {
+		o := storages.NewCopyOptions(opts...)
+		if err := s.multipartCopy(ctx, srcKey, dstKey, head, resolveCopyPartSize(o), s.copyConcurrency(o)); err != nil {
+			return storages.CopyStat{}, err
+		}
+		return stat, nil
+	}
+
+	return s.copyObject(ctx, srcKey, dstKey, head.ETag, stat.Bytes)
+}
+
+// copyObject copies srcKey to dstKey with one CopyObject pinned to etag, failing
+// with ErrSourceChanged if the source no longer matches.
+func (s *Storage) copyObject(
+	ctx context.Context, srcKey, dstKey string, etag *string, size int64,
+) (storages.CopyStat, error) {
+	in := &s3.CopyObjectInput{
+		Bucket:       aws.String(s.config.Bucket),
+		CopySource:   aws.String(copySource(s.config.Bucket, srcKey)),
+		Key:          aws.String(dstKey),
+		StorageClass: types.StorageClass(s.config.StorageClass),
+		// Pinned so the reported size is the size copied.
+		CopySourceIfMatch: etag,
+	}
+	s.config.encryption().apply(&in.ServerSideEncryption, &in.SSEKMSKeyId, &in.BucketKeyEnabled)
+	if _, err := s.service.CopyObject(ctx, in); err != nil {
+		switch {
+		case isNotFound(err):
+			// The source can vanish after it was inspected.
+			return storages.CopyStat{}, storages.ErrFileNotFound
+		case isPreconditionFailed(err):
+			return storages.CopyStat{}, fmt.Errorf("%w: %w", storages.ErrSourceChanged, err)
+		}
+		return storages.CopyStat{}, fmt.Errorf("s3 object copying error: %w", err)
+	}
+	return storages.CopyStat{Bytes: size}, nil
+}
+
+// resolveCopyPartSize returns the caller's part size clamped to S3's limits, or
+// copyPartSize.
+func resolveCopyPartSize(o storages.CopyOptions) int64 {
+	if o.PartSize <= 0 {
+		return copyPartSize
+	}
+	return min(max(o.PartSize, manager.MinUploadPartSize), maxCopyPartSize)
+}
+
+// copyConcurrency returns the part-copy concurrency: the option, then
+// Config.Concurrency, then the SDK upload default.
+func (s *Storage) copyConcurrency(o storages.CopyOptions) int {
+	switch {
+	case o.Concurrency > 0:
+		return o.Concurrency
+	case s.config.Concurrency > 0:
+		return s.config.Concurrency
+	default:
+		return manager.DefaultUploadConcurrency
+	}
+}
+
+// multipartCopy copies an object above 5 GiB with UploadPartCopy, carrying over
+// head's content headers, metadata and tags as CopyObject would. Failure aborts it.
+func (s *Storage) multipartCopy(
+	ctx context.Context, srcKey, dstKey string, head *s3.HeadObjectOutput, partSize int64, concurrency int,
+) error {
+	size := aws.ToInt64(head.ContentLength)
+	// S3 caps an upload at 10000 parts.
+	partSize = max(partSize, (size+int64(manager.MaxUploadParts)-1)/int64(manager.MaxUploadParts))
+
+	create := &s3.CreateMultipartUploadInput{
+		Bucket:             aws.String(s.config.Bucket),
+		Key:                aws.String(dstKey),
+		StorageClass:       types.StorageClass(s.config.StorageClass),
+		CacheControl:       head.CacheControl,
+		ContentDisposition: head.ContentDisposition,
+		ContentEncoding:    head.ContentEncoding,
+		ContentLanguage:    head.ContentLanguage,
+		ContentType:        head.ContentType,
+		Expires:            head.Expires,
+		Metadata:           head.Metadata,
+	}
+	if aws.ToInt32(head.TagCount) > 0 {
+		tagging, err := s.sourceTagging(ctx, srcKey, head.VersionId)
+		if err != nil {
+			return err
+		}
+		create.Tagging = aws.String(tagging)
+	}
+	s.config.encryption().apply(&create.ServerSideEncryption, &create.SSEKMSKeyId, &create.BucketKeyEnabled)
+	upload, err := s.service.CreateMultipartUpload(ctx, create)
+	if err != nil {
+		return fmt.Errorf("error starting multipart copy: %w", err)
+	}
+
+	parts, err := s.copyParts(ctx, srcKey, dstKey, upload.UploadId, head.ETag, size, partSize, concurrency)
+	if err == nil {
+		_, err = s.service.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:          aws.String(s.config.Bucket),
+			Key:             aws.String(dstKey),
+			UploadId:        upload.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+		})
+		if err == nil {
+			return nil
+		}
+		err = fmt.Errorf("error completing multipart copy: %w", err)
+	}
+
+	// Abort even on cancel: copied parts are billed until the upload is aborted.
+	if _, aerr := s.service.AbortMultipartUpload(context.WithoutCancel(ctx), &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(s.config.Bucket),
+		Key:      aws.String(dstKey),
+		UploadId: upload.UploadId,
+	}); aerr != nil {
+		s.logger.Warn("error aborting multipart copy", "key", dstKey, "upload_id", aws.ToString(upload.UploadId), "error", aerr)
+	}
+	switch {
+	case isNotFound(err):
+		return storages.ErrFileNotFound
+	case isPreconditionFailed(err):
+		return fmt.Errorf("%w: %w", storages.ErrSourceChanged, err)
+	}
+	return err
+}
+
+// sourceTagging returns the source version's tags as a URL-encoded query string.
+func (s *Storage) sourceTagging(ctx context.Context, srcKey string, versionID *string) (string, error) {
+	out, err := s.service.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+		Bucket:    aws.String(s.config.Bucket),
+		Key:       aws.String(srcKey),
+		VersionId: versionID,
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return "", storages.ErrFileNotFound
+		}
+		return "", fmt.Errorf("error getting object tags: %w", err)
+	}
+	tags := url.Values{}
+	for _, tag := range out.TagSet {
+		tags.Set(aws.ToString(tag.Key), aws.ToString(tag.Value))
+	}
+	// S3 wants %20 for a space; a literal "+" is already %2B.
+	return strings.ReplaceAll(tags.Encode(), "+", "%20"), nil
+}
+
+// copyParts copies every partSize range of srcKey, each pinned to etag, and
+// returns the completed parts in order.
+func (s *Storage) copyParts(
+	ctx context.Context, srcKey, dstKey string, uploadID, etag *string, size, partSize int64, concurrency int,
+) ([]types.CompletedPart, error) {
+	count := int((size + partSize - 1) / partSize)
+	parts := make([]types.CompletedPart, count)
+	source := aws.String(copySource(s.config.Bucket, srcKey))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(max(concurrency, 1))
+	for i := range count {
+		g.Go(func() error {
+			// Skip parts whose turn comes after a failure rather than send them.
+			if err := gctx.Err(); err != nil {
+				return err
+			}
+			number := aws.Int32(int32(i + 1))
+			start := int64(i) * partSize
+			end := min(start+partSize, size) - 1
+			out, err := s.service.UploadPartCopy(gctx, &s3.UploadPartCopyInput{
+				Bucket:            aws.String(s.config.Bucket),
+				Key:               aws.String(dstKey),
+				UploadId:          uploadID,
+				PartNumber:        number,
+				CopySource:        source,
+				CopySourceRange:   aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+				CopySourceIfMatch: etag,
+			})
+			if err != nil {
+				return fmt.Errorf("error copying part %d: %w", i+1, err)
+			}
+			var partETag *string
+			if out.CopyPartResult != nil {
+				partETag = out.CopyPartResult.ETag
+			}
+			parts[i] = types.CompletedPart{ETag: partETag, PartNumber: number}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return parts, nil
+}
+
+// copySource renders the x-amz-copy-source value, escaping each segment with
+// spaces as %20, since S3 reads "+" as a literal plus.
+func copySource(bucket, key string) string {
+	segments := strings.Split(key, "/")
+	for i, seg := range segments {
+		segments[i] = strings.ReplaceAll(url.QueryEscape(seg), "+", "%20")
+	}
+	return bucket + "/" + strings.Join(segments, "/")
 }
 
 // Delete removes the named objects. Every key is verified to exist first, so a
@@ -518,6 +765,30 @@ func (s *Storage) deleteKnown(ctx context.Context, filePaths ...string) error {
 		}
 	}
 	return nil
+}
+
+// CopyAll copies every object under srcPrefix to dstPrefix with
+// storages.CopyListed, using each object's listed size and ETag in place of a HEAD.
+func (s *Storage) CopyAll(
+	ctx context.Context, srcPrefix, dstPrefix string, opts ...storages.CopyAllOption,
+) (storages.CopyStat, error) {
+	return storages.CopyListed(ctx, s, srcPrefix, dstPrefix, s.copyListed, opts...)
+}
+
+// copyListed copies a listed object with one CopyObject pinned to its listed
+// ETag, falling back to Copy when the listing is stale or not enough.
+func (s *Storage) copyListed(
+	ctx context.Context, obj storages.ObjectStat, srcPath, dstPath string, opts ...storages.CopyOption,
+) (storages.CopyStat, error) {
+	srcKey, dstKey := path.Join(s.prefix, srcPath), path.Join(s.prefix, dstPath)
+	// Above 5 GiB the multipart copy needs the HEAD's headers.
+	if obj.ETag != "" && obj.Size <= maxCopyObjectSize && srcKey != dstKey {
+		stat, err := s.copyObject(ctx, srcKey, dstKey, aws.String(obj.ETag), obj.Size)
+		if !errors.Is(err, storages.ErrSourceChanged) {
+			return stat, err
+		}
+	}
+	return s.Copy(ctx, srcPath, dstPath, opts...)
 }
 
 func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {
@@ -606,6 +877,7 @@ func (s *Storage) Stat(fileName string) (*storages.ObjectStat, error) {
 		LastModified: aws.ToTime(headObjectOutput.LastModified),
 		Exist:        true,
 		Size:         aws.ToInt64(headObjectOutput.ContentLength),
+		ETag:         aws.ToString(headObjectOutput.ETag),
 	}, nil
 }
 
@@ -658,6 +930,20 @@ func isInvalidRange(err error) bool {
 	var respErr *awshttp.ResponseError
 	if errors.As(err, &respErr) {
 		return respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable
+	}
+	return false
+}
+
+// isPreconditionFailed reports whether a conditional request failed, by error
+// code or, for S3-compatible endpoints, by HTTP 412.
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == PreconditionFailedAwsErrorCode {
+		return true
+	}
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.HTTPStatusCode() == http.StatusPreconditionFailed
 	}
 	return false
 }

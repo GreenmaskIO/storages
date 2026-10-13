@@ -20,17 +20,21 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
+	"runtime"
+	"strings"
 	"testing"
 
+	"github.com/greenmaskio/storages"
+	"github.com/pkg/sftp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
-
-	"github.com/greenmaskio/storages"
 )
 
 // The end-to-end behavior of this backend against a real OpenSSH server lives in
@@ -228,6 +232,121 @@ func TestStorage_GetObjectRange(t *testing.T) {
 	})
 }
 
+// TestStorage_Copy covers Copy against the in-process server, which lacks
+// posix-rename, so the plain-rename fallback is what runs.
+func TestStorage_Copy(t *testing.T) {
+	ctx := context.Background()
+
+	// names lists every file in st, leftover .copy- temporaries included.
+	names := func(t *testing.T, st storages.Storager) []string {
+		t.Helper()
+		objects, err := st.List(ctx, "")
+		require.NoError(t, err)
+		var res []string
+		for _, o := range objects {
+			res = append(res, o.Name)
+		}
+		return res
+	}
+
+	t.Run("copies and overwrites, leaving no temporary behind", func(t *testing.T) {
+		st := newLocalStorage(t)
+		putObject(t, st, "src.txt", []byte("new"))
+		putObject(t, st, "dir/dst.txt", []byte("old and longer"))
+
+		stat, err := st.Copy(ctx, "src.txt", "dir/dst.txt")
+		require.NoError(t, err)
+
+		assert.Equal(t, storages.CopyStat{Bytes: int64(len("new")), Streamed: true}, stat,
+			"ssh has no server-side copy, so every copy is streamed")
+
+		assert.Equal(t, "new", readObject(t, st, "dir/dst.txt"))
+		assert.Equal(t, "new", readObject(t, st, "src.txt"))
+		assert.Equal(t, []string{"dir/dst.txt", "src.txt"}, names(t, st))
+	})
+
+	t.Run("a symlink to the source does not empty it", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlinks need extra privileges on Windows")
+		}
+		st := newLocalStorage(t)
+		putObject(t, st, "src.txt", []byte("keep me"))
+		require.NoError(t, os.Symlink(path.Join(st.GetCwd(), "src.txt"), path.Join(st.GetCwd(), "link.txt")))
+
+		_, err := st.Copy(ctx, "src.txt", "link.txt")
+		require.NoError(t, err)
+
+		assert.Equal(t, "keep me", readObject(t, st, "src.txt"))
+		assert.Equal(t, "keep me", readObject(t, st, "link.txt"))
+	})
+
+	// An unguarded storage passes keys uncleaned; the temporary must still land
+	// next to the cleaned destination.
+	t.Run("an uncleaned destination key", func(t *testing.T) {
+		for _, dst := range []string{"dir/dst.txt/", "dir/sub/../dst.txt", "dir//dst.txt"} {
+			t.Run(dst, func(t *testing.T) {
+				st := newLocalRawStorage(t)
+				putObject(t, st, "src.txt", []byte("new"))
+				putObject(t, st, "dir/other.txt", []byte("o"))
+
+				_, err := st.Copy(ctx, "src.txt", dst)
+				require.NoError(t, err)
+
+				assert.Equal(t, "new", readObject(t, st, "dir/dst.txt"))
+				assert.Equal(t, []string{"dir/dst.txt", "dir/other.txt", "src.txt"}, names(t, st))
+				_, dirs, err := mustSubRaw(t, st, "dir").ListDir(ctx)
+				require.NoError(t, err)
+				assert.Empty(t, dirs, "no stray directory is left behind")
+			})
+		}
+	})
+
+	t.Run("a cancelled copy stops and leaves no temporary behind", func(t *testing.T) {
+		st := newLocalStorage(t)
+		putObject(t, st, "src.txt", bytes.Repeat([]byte("x"), 1<<20))
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+
+		_, err := st.Copy(cancelled, "src.txt", "dir/dst.txt")
+
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Equal(t, []string{"src.txt"}, names(t, st))
+	})
+
+	t.Run("a failed copy leaves no temporary behind", func(t *testing.T) {
+		st := newLocalStorage(t)
+		putObject(t, st, "dir/a.txt", []byte("a"))
+
+		_, err := st.Copy(ctx, "dir", "copy.txt")
+		assert.ErrorIs(t, err, storages.ErrFileNotFound)
+		_, err = st.Copy(ctx, "missing.txt", "copy.txt")
+		assert.ErrorIs(t, err, storages.ErrFileNotFound)
+
+		assert.Equal(t, []string{"dir/a.txt"}, names(t, st))
+	})
+
+	t.Run("a directory destination is an error and stays in place", func(t *testing.T) {
+		st := newLocalStorage(t)
+		putObject(t, st, "src.txt", []byte("src"))
+		putObject(t, st, "dir/a.txt", []byte("a"))
+
+		_, err := st.Copy(ctx, "src.txt", "dir")
+		require.ErrorContains(t, err, "is a directory")
+
+		assert.Equal(t, []string{"dir/a.txt", "src.txt"}, names(t, st))
+	})
+}
+
+func readObject(t *testing.T, st storages.Storager, key string) string {
+	t.Helper()
+	r, err := st.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, r.Close()) }()
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	return string(got)
+}
+
 func TestStorage_List(t *testing.T) {
 	ctx := context.Background()
 
@@ -348,4 +467,133 @@ func TestNewStorage_GuardsKeysByDefault(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, unsafe.Close()) })
 	_, ok := unsafe.(*Storage)
 	assert.True(t, ok, "WithUnsafe must yield the bare backend")
+}
+
+// renameFS is an SFTPClient double for driving replaceFile through failures;
+// only the methods replaceFile uses are implemented.
+type renameFS struct {
+	SFTPClient
+	files map[string]string
+	// posixErr is what PosixRename answers; nil performs it.
+	posixErr error
+	// failRename makes Rename(from, to) fail for the listed from→to pairs.
+	failRename map[[2]string]bool
+}
+
+func (f *renameFS) PosixRename(from, to string) error {
+	if f.posixErr != nil {
+		return f.posixErr
+	}
+	return f.move(from, to)
+}
+
+func (f *renameFS) Rename(from, to string) error {
+	if f.failRename[[2]string{from, to}] {
+		return errors.New("rename refused")
+	}
+	if _, ok := f.files[to]; ok {
+		return errors.New("target exists")
+	}
+	return f.move(from, to)
+}
+
+func (f *renameFS) Remove(p string) error {
+	if _, ok := f.files[p]; !ok {
+		return os.ErrNotExist
+	}
+	delete(f.files, p)
+	return nil
+}
+
+func (f *renameFS) move(from, to string) error {
+	content, ok := f.files[from]
+	if !ok {
+		return os.ErrNotExist
+	}
+	delete(f.files, from)
+	f.files[to] = content
+	return nil
+}
+
+// asideFile returns the one file replaceFile parked dst under, if any.
+func (f *renameFS) asideFile(t *testing.T) (string, bool) {
+	t.Helper()
+	for p := range f.files {
+		if strings.HasPrefix(path.Base(p), ".copy-") {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+func TestStorage_replaceFile(t *testing.T) {
+	st := &Storage{logger: slog.New(slog.DiscardHandler)}
+	unsupported := &sftp.StatusError{Code: uint32(sftp.ErrSSHFxOpUnsupported)}
+
+	t.Run("posix-rename replaces the destination", func(t *testing.T) {
+		fs := &renameFS{files: map[string]string{"/d/tmp": "new", "/d/dst": "old"}}
+		require.NoError(t, st.replaceFile(fs, "/d/tmp", "/d/dst"))
+		assert.Equal(t, map[string]string{"/d/dst": "new"}, fs.files)
+	})
+
+	// Servers answer posix-rename as unsupported or with a plain failure.
+	for name, posixErr := range map[string]error{"unsupported": unsupported, "failure": errors.New("failure")} {
+		t.Run("fallback after posix-rename "+name, func(t *testing.T) {
+			fs := &renameFS{files: map[string]string{"/d/tmp": "new", "/d/dst": "old"}, posixErr: posixErr}
+			require.NoError(t, st.replaceFile(fs, "/d/tmp", "/d/dst"))
+			assert.Equal(t, map[string]string{"/d/dst": "new"}, fs.files, "the parked destination is removed")
+		})
+	}
+
+	t.Run("fallback with no destination yet", func(t *testing.T) {
+		fs := &renameFS{files: map[string]string{"/d/tmp": "new"}, posixErr: unsupported}
+		require.NoError(t, st.replaceFile(fs, "/d/tmp", "/d/dst"))
+		assert.Equal(t, map[string]string{"/d/dst": "new"}, fs.files)
+	})
+
+	t.Run("a failed swap puts the destination back", func(t *testing.T) {
+		fs := &renameFS{
+			files:      map[string]string{"/d/tmp": "new", "/d/dst": "old"},
+			posixErr:   unsupported,
+			failRename: map[[2]string]bool{{"/d/tmp", "/d/dst"}: true},
+		}
+		require.Error(t, st.replaceFile(fs, "/d/tmp", "/d/dst"))
+		assert.Equal(t, map[string]string{"/d/tmp": "new", "/d/dst": "old"}, fs.files)
+	})
+
+	t.Run("a failed restore says where the destination went", func(t *testing.T) {
+		fs := &renameFS{
+			files:    map[string]string{"/d/tmp": "new", "/d/dst": "old"},
+			posixErr: unsupported,
+		}
+		// Fail the swap, and the restore from whatever the parked name is.
+		fs.failRename = map[[2]string]bool{{"/d/tmp", "/d/dst"}: true}
+		restore := &restoreFailer{renameFS: fs}
+
+		err := st.replaceFile(restore, "/d/tmp", "/d/dst")
+
+		require.Error(t, err)
+		aside, ok := fs.asideFile(t)
+		require.True(t, ok, "the previous destination must still exist somewhere")
+		assert.Equal(t, "old", fs.files[aside])
+		assert.Contains(t, err.Error(), aside)
+	})
+}
+
+// restoreFailer fails any rename back onto /d/dst from a parked .copy- file.
+type restoreFailer struct{ *renameFS }
+
+func (r *restoreFailer) Rename(from, to string) error {
+	if to == "/d/dst" && strings.HasPrefix(path.Base(from), ".copy-") {
+		return errors.New("restore refused")
+	}
+	return r.renameFS.Rename(from, to)
+}
+
+// mustSubRaw re-roots st at subPath, failing the test if the storage refuses.
+func mustSubRaw(t *testing.T, st storages.Storager, subPath string) storages.Storager {
+	t.Helper()
+	sub, err := st.SubStorage(subPath, true)
+	require.NoError(t, err)
+	return sub
 }

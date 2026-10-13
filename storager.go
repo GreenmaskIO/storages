@@ -12,12 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package storages defines Storager, the backend-agnostic interface implemented
-// by every storage backend (directory, s3, azure, ssh, and the in-memory
-// inmemory backend), together with the shared ErrFileNotFound, ErrInvalidRange
-// and ErrUnsafeKey sentinels, the Guard key gate and the Walk helper. It is the
-// foundation package: backends import it, never the reverse, so the dependency
-// graph stays acyclic.
+// Package storages defines Storager, the interface every storage backend
+// implements, plus the helpers and errors shared by all of them.
 package storages
 
 import (
@@ -26,125 +22,94 @@ import (
 	"time"
 )
 
-// ObjectStat is the metadata returned by Storager.Stat and by Storager.List. A
-// missing object is reported via Exist being false, not via an error.
-//
-// Name is filled differently by the two producers: Stat reports the full path it
-// was asked about (cwd-joined), while List reports a path relative to the prefix
-// it was given.
+// ObjectStat is an object's metadata. Stat names it by its full path, List by
+// its path relative to the listed prefix.
 type ObjectStat struct {
 	Name         string
 	LastModified time.Time
-	Exist        bool
-	// Size is the object's size in bytes. It is 0 when Exist is false.
+	// Exist is false when Stat finds no object; that is not an error.
+	Exist bool
+	// Size is the object's size in bytes, 0 when Exist is false.
 	Size int64
+	// ETag is the object's quoted HTTP entity tag, changing on every overwrite.
+	// Only s3 and azure fill it.
+	ETag string
 }
 
-// Storager is the common interface implemented by every storage backend. It
-// models a directory-like namespace: a backend instance is rooted at a "current
-// working directory" (GetCwd) and exposes object CRUD plus hierarchical
-// navigation via SubStorage and ListDir.
-//
-// Paths passed to the object methods are interpreted relative to the backend's
-// current working directory and use forward slashes on every OS. A missing
-// object surfaces differently per method: GetObject, Delete and DeleteAll
-// return an error wrapping ErrFileNotFound, while Exists and Stat report it as
-// a value with a nil error. ListDir returns []Storager and SubStorage returns
-// Storager, which makes the interface self-referential — this is why the
-// interface lives in a foundation package that no backend may import back into.
-//
-// Every backend constructor in this module returns a guarded storage: a key
-// that reaches outside the storage — "../../etc/passwd" — or that names its
-// root is refused with ErrUnsafeKey before the backend resolves it, and the
-// storages SubStorage and ListDir return are guarded in turn. That makes it
-// safe to build keys out of untrusted input. Each backend's WithUnsafe option
-// turns the gate off for callers whose keys are all trusted; see Guard for what
-// exactly is refused.
-//
-// SubStorage is the one navigation method that can refuse: its sub-path is a
-// key like any other, and a guarded storage returns ErrUnsafeKey rather than a
-// storage rooted outside itself.
+// Storager is a directory-like object store; keys are slash-separated and
+// relative to its working directory. See Guard for which keys are refused.
 type Storager interface {
-	// GetCwd returns the current working directory (root path/prefix) of this
-	// storage instance.
-	GetCwd() string
-	// Dirname returns the base name of the current working directory.
-	Dirname() string
-	// ListDir lists the immediate contents of the current directory, returning
-	// the file names and a Storager for each sub-directory.
-	ListDir(ctx context.Context) (files []string, dirs []Storager, err error)
-	// List returns every object under prefix, recursively, with its size. The
-	// prefix is directory-like and relative to the current working directory, so
-	// an empty prefix lists the whole tree and the prefix "data" never matches
-	// the sibling "database". Returned names are slash-separated, relative to
-	// prefix, and sorted lexicographically; each ObjectStat has Exist true.
-	//
-	// Unlike DeleteAll, a prefix holding nothing is not an error: the result is
-	// an empty slice with a nil error, whether the prefix is empty or absent
-	// entirely. Listing a possibly-empty directory is an ordinary question, and
-	// it is the answer every backend gives natively.
-	List(ctx context.Context, prefix string) ([]ObjectStat, error)
-	// GetObject opens the object at filePath for reading. It returns
-	// ErrFileNotFound if the object does not exist. The caller must Close the
-	// returned reader.
-	GetObject(ctx context.Context, filePath string) (reader io.ReadCloser, err error)
-	// GetObjectRange opens a byte range of the object at filePath for reading.
-	// offset is counted from the start of the object and length is the number of
-	// bytes wanted; a negative length means "to the end of the object". The
-	// caller must Close the returned reader.
-	//
-	// A range whose end falls past the end of the object is clamped — the reader
-	// simply ends early — but a range that cannot yield anything at all is
-	// rejected with ErrInvalidRange: a negative offset, an offset at or past the
-	// object's size (which makes every range on a zero-length object invalid),
-	// or a length of exactly 0. Backends only transfer the requested bytes, so
-	// this is not GetObject plus a seek. A missing object is ErrFileNotFound,
-	// as in GetObject.
-	GetObjectRange(ctx context.Context, filePath string, offset, length int64) (reader io.ReadCloser, err error)
-	// PutObject writes body to the object at filePath, overwriting an existing
-	// object and creating any intermediate directories as needed.
-	PutObject(ctx context.Context, filePath string, body io.Reader) error
-	// Delete removes the named objects. It is object-level and never recursive:
-	// a path naming a directory rather than an object is not deleted. Use
-	// DeleteAll to remove a sub-tree.
-	//
-	// Every path is verified before anything is removed. If any path is not an
-	// existing object — absent, or a directory — nothing is deleted and the
-	// error is a *MissingObjectsError listing them, which wraps ErrFileNotFound.
-	// Delete is therefore not idempotent: deleting the same object twice fails
-	// the second time.
-	Delete(ctx context.Context, filePaths ...string) error
-	// DeleteAll recursively removes everything under pathPrefix, including the
-	// prefix "directory" itself on backends that have real directories.
-	//
-	// A prefix holding nothing is a *MissingObjectsError wrapping
-	// ErrFileNotFound, so DeleteAll is likewise not idempotent: re-running a
-	// deletion that already succeeded fails.
-	DeleteAll(ctx context.Context, pathPrefix string) error
-	// Exists reports whether fileName exists in the current directory. A missing
-	// object is (false, nil), not an error; an error means the lookup itself
-	// failed.
-	Exists(ctx context.Context, fileName string) (bool, error)
-	// SubStorage returns a Storager rooted at subPath. When relative is true the
-	// path is joined onto the current working directory; otherwise it is used as
-	// an absolute root. The returned storage shares the parent's connection and
-	// configuration.
-	//
-	// Re-rooting reaches no backend, so the backends never fail here. The error
-	// is the storage's way of refusing the path: a guarded storage returns
-	// ErrUnsafeKey for a relative subPath that walks out of it, which is the one
-	// case where no storage can be returned at all.
-	SubStorage(subPath string, relative bool) (Storager, error)
-	// Stat returns metadata about fileName. A non-existent object is reported via
-	// ObjectStat.Exist being false with a nil error; an error means the lookup
-	// itself failed.
-	Stat(fileName string) (*ObjectStat, error)
-	// Ping checks connectivity/reachability of the underlying storage. It forces
-	// a real connection where the backend connects lazily.
+	Reader
+	Writer
+	Deleter
+	Inspector
+	Navigator
+	Copier
+	// Ping checks that the storage is reachable, connecting if it has not yet.
 	Ping(ctx context.Context) error
-	// Close releases any resources held by the storage (e.g. the ssh backend's
-	// connection). It is safe to call on backends that hold none, and callers
-	// should always call it when done. SubStorage clones share the parent's
-	// resources, so Close should be called on the owning root instance.
-	Close() error
+	// Close releases the storage's resources. Call it on the root storage, not
+	// on one returned by SubStorage or ListDir, which share them.
+	io.Closer
+}
+
+// Reader reads objects.
+type Reader interface {
+	// GetObject opens filePath for reading; a missing object is ErrFileNotFound.
+	GetObject(ctx context.Context, filePath string) (reader io.ReadCloser, err error)
+	// GetObjectRange opens length bytes at offset, or to the end if length < 0.
+	// A range yielding nothing is ErrInvalidRange; one past the end is clamped.
+	GetObjectRange(ctx context.Context, filePath string, offset, length int64) (reader io.ReadCloser, err error)
+}
+
+// Writer writes objects.
+type Writer interface {
+	// PutObject writes body to filePath, overwriting it and creating parent
+	// directories.
+	PutObject(ctx context.Context, filePath string, body io.Reader) error
+}
+
+// Deleter removes objects.
+type Deleter interface {
+	// Delete removes the named objects, or none of them if any is missing or a
+	// directory: that is a *MissingObjectsError wrapping ErrFileNotFound.
+	Delete(ctx context.Context, filePaths ...string) error
+	// DeleteAll removes everything under pathPrefix. An empty prefix is a
+	// *MissingObjectsError wrapping ErrFileNotFound.
+	DeleteAll(ctx context.Context, pathPrefix string) error
+}
+
+// Inspector reports which objects exist without reading them. A missing object
+// is a value, not an error.
+type Inspector interface {
+	// List returns every object under prefix, recursively, sorted by name. An
+	// empty or absent prefix yields an empty slice.
+	List(ctx context.Context, prefix string) ([]ObjectStat, error)
+	// Stat returns fileName's metadata, with Exist false if it is missing.
+	Stat(fileName string) (*ObjectStat, error)
+	// Exists reports whether fileName is an object.
+	Exists(ctx context.Context, fileName string) (bool, error)
+}
+
+// Navigator moves through the storage's directory tree.
+type Navigator interface {
+	// GetCwd returns the storage's working directory.
+	GetCwd() string
+	// Dirname returns the base name of the working directory.
+	Dirname() string
+	// ListDir returns the files in the working directory and a Storager for
+	// each sub-directory.
+	ListDir(ctx context.Context) (files []string, dirs []Storager, err error)
+	// SubStorage returns a Storager rooted at subPath, joined onto the working
+	// directory if relative. A guarded storage refuses an escaping path.
+	SubStorage(subPath string, relative bool) (Storager, error)
+}
+
+// Copier copies objects within one storage.
+type Copier interface {
+	// Copy copies srcPath to dstPath, overwriting it. A missing or directory
+	// source is ErrFileNotFound; on s3, a source changed mid-copy is ErrSourceChanged.
+	Copy(ctx context.Context, srcPath, dstPath string, opts ...CopyOption) (CopyStat, error)
+	// CopyAll copies every object under srcPrefix to dstPrefix. It is not
+	// atomic: the first error cancels the rest, and finished copies stay.
+	CopyAll(ctx context.Context, srcPrefix, dstPrefix string, opts ...CopyAllOption) (CopyStat, error)
 }

@@ -87,14 +87,13 @@ func TestConfig_Validate_DefaultConfigIsValid(t *testing.T) {
 	require.NoError(t, cfg.Validate())
 }
 
-// A KMS key with no SSE must never reach the wire on its own: the key header
-// alone is meaningless to S3. Validate rejects that config, and the early
-// return in applyEncryption keeps it structurally impossible regardless.
-func TestConfig_applyEncryption_NoSSEEmitsNothing(t *testing.T) {
+// TestConfig_encryption_NoSSEEmitsNothing checks that a KMS key with no SSE
+// never reaches the wire on its own.
+func TestConfig_encryption_NoSSEEmitsNothing(t *testing.T) {
 	cfg := &Config{KMSKeyARN: testKMSKeyARN, BucketKeyEnabled: true}
 	in := &s3.PutObjectInput{}
 
-	cfg.applyEncryption(in)
+	cfg.encryption().apply(&in.ServerSideEncryption, &in.SSEKMSKeyId, &in.BucketKeyEnabled)
 
 	assert.Empty(t, in.ServerSideEncryption)
 	assert.Nil(t, in.SSEKMSKeyId)

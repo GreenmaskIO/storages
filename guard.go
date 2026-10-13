@@ -124,6 +124,33 @@ func (g *guard) DeleteAll(ctx context.Context, pathPrefix string) error {
 	return g.store.DeleteAll(ctx, safe)
 }
 
+// Copy gates both keys before either reaches the backend.
+func (g *guard) Copy(ctx context.Context, srcPath, dstPath string, opts ...CopyOption) (CopyStat, error) {
+	src, err := objectKey(srcPath)
+	if err != nil {
+		return CopyStat{}, err
+	}
+	dst, err := objectKey(dstPath)
+	if err != nil {
+		return CopyStat{}, err
+	}
+	return g.store.Copy(ctx, src, dst, opts...)
+}
+
+// CopyAll gates both prefixes; the root is allowed, as in List. The backend's
+// CopyAll checks each key it lists.
+func (g *guard) CopyAll(ctx context.Context, srcPrefix, dstPrefix string, opts ...CopyAllOption) (CopyStat, error) {
+	src, err := listPrefix(srcPrefix)
+	if err != nil {
+		return CopyStat{}, err
+	}
+	dst, err := listPrefix(dstPrefix)
+	if err != nil {
+		return CopyStat{}, err
+	}
+	return g.store.CopyAll(ctx, src, dst, opts...)
+}
+
 func (g *guard) Exists(ctx context.Context, fileName string) (bool, error) {
 	safe, err := objectKey(fileName)
 	if err != nil {

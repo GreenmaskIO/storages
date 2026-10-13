@@ -357,6 +357,20 @@ func TestStorage_Integration(t *testing.T) {
 		})
 	})
 
+	t.Run("CopyAll copies server-side", func(t *testing.T) {
+		ctx := context.Background()
+		st := newTestStorage(t)
+		putObject(t, st, "src/a.txt", []byte("a"))
+		putObject(t, st, "src/d/b.txt", []byte("bb"))
+
+		stat, err := st.CopyAll(ctx, "src", "dst")
+		require.NoError(t, err)
+
+		assert.Equal(t, storages.CopyStat{Bytes: 3, Objects: 2}, stat, "no blob was streamed")
+		assert.Equal(t, []byte("a"), mustGet(t, st, "dst/a.txt"))
+		assert.Equal(t, []byte("bb"), mustGet(t, st, "dst/d/b.txt"))
+	})
+
 	t.Run("List", func(t *testing.T) {
 		st := newTestStorage(t)
 		putObject(t, st, "a.txt", []byte("1"))

@@ -19,6 +19,8 @@ package ssh
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/greenmaskio/storages"
@@ -386,6 +389,147 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 	return nil
 }
 
+// Copy streams srcPath through the client into a temporary sibling and renames it
+// over dstPath, as SFTP has no reliable copy. Options are ignored.
+func (s *Storage) Copy(ctx context.Context, srcPath, dstPath string, _ ...storages.CopyOption) (storages.CopyStat, error) {
+	client, err := s.sftpLazy.Client(ctx)
+	if err != nil {
+		return storages.CopyStat{}, err
+	}
+
+	// SFTP opens a directory as readily as a file, so check here.
+	srcFull := path.Join(s.cwd, srcPath)
+	dstFull := path.Join(s.cwd, dstPath)
+	info, err := client.Stat(srcFull)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return storages.CopyStat{}, storages.ErrFileNotFound
+	case err != nil:
+		return storages.CopyStat{}, fmt.Errorf("get stats of object %q via SFTP: %w", srcFull, err)
+	case info.IsDir():
+		// A directory is not an object, as in Delete.
+		return storages.CopyStat{}, storages.ErrFileNotFound
+	}
+	if srcFull == dstFull {
+		return storages.CopyStat{}, nil
+	}
+	// A rename would move a destination directory aside, or replace it if empty.
+	switch dstInfo, err := client.Stat(dstFull); {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return storages.CopyStat{}, fmt.Errorf("get stats of object %q via SFTP: %w", dstFull, err)
+	case dstInfo.IsDir():
+		return storages.CopyStat{}, fmt.Errorf("copy destination %q is a directory", dstFull)
+	}
+
+	src, err := client.Open(srcFull)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return storages.CopyStat{}, storages.ErrFileNotFound
+		}
+		return storages.CopyStat{}, fmt.Errorf("open file %q via SFTP: %w", srcFull, err)
+	}
+	defer s.closeQuietly(src, srcFull)
+
+	if err := client.MkdirAll(path.Dir(dstFull)); err != nil {
+		return storages.CopyStat{}, fmt.Errorf("create directory %q via SFTP: %w", path.Dir(dstFull), err)
+	}
+	tmpFull, err := tempSibling(dstFull)
+	if err != nil {
+		return storages.CopyStat{}, err
+	}
+	tmp, err := client.Create(tmpFull)
+	if err != nil {
+		return storages.CopyStat{}, fmt.Errorf("create file %q via SFTP: %w", tmpFull, err)
+	}
+
+	n, err := s.fillAndReplace(ctx, client, tmp, src, dstFull)
+	if err != nil {
+		s.removeQuietly(client, tmpFull)
+		return storages.CopyStat{}, fmt.Errorf("copy to %q via SFTP: %w", dstFull, err)
+	}
+	return storages.CopyStat{Bytes: n, Streamed: true}, nil
+}
+
+// fillAndReplace copies src into tmp, closing tmp, and renames tmp over dst.
+// The copy runs in this goroutine, so nothing uses tmp once it returns.
+func (s *Storage) fillAndReplace(
+	ctx context.Context, client SFTPClient, tmp *sftp.File, src io.Reader, dst string,
+) (int64, error) {
+	// src stays unwrapped so io.Copy uses its WriteTo, which reads ahead concurrently.
+	n, err := io.Copy(ctxWriter{ctx: ctx, w: tmp}, src)
+	if cerr := tmp.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("close copy: %w", cerr)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if err := s.replaceFile(client, tmp.Name(), dst); err != nil {
+		return 0, fmt.Errorf("move copy into place: %w", err)
+	}
+	return n, nil
+}
+
+// ctxWriter fails writes once ctx ends, which is how a copy is cancelled:
+// closing an sftp.File waits for any transfer in progress, so it cannot interrupt one.
+type ctxWriter struct {
+	ctx context.Context
+	w   io.Writer
+}
+
+func (c ctxWriter) Write(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.w.Write(p)
+}
+
+// tempSibling names a hidden, unique file in the same directory as p, so a
+// rename between the two stays within one filesystem.
+func tempSibling(p string) (string, error) {
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("generate temporary name: %w", err)
+	}
+	return path.Join(path.Dir(p), ".copy-"+hex.EncodeToString(suffix[:])), nil
+}
+
+// replaceFile renames src over dst, leaving dst as it was on failure. Without
+// posix-rename, dst is moved aside first, never removed: it may alias the source.
+func (s *Storage) replaceFile(client SFTPClient, src, dst string) error {
+	posixErr := client.PosixRename(src, dst)
+	if posixErr == nil {
+		return nil
+	}
+
+	aside, err := tempSibling(dst)
+	if err != nil {
+		return err
+	}
+	switch err := client.Rename(dst, aside); {
+	case errors.Is(err, os.ErrNotExist):
+		// Nothing to replace.
+		return client.Rename(src, dst)
+	case err != nil:
+		return fmt.Errorf("%w (after posix-rename failed: %w)", err, posixErr)
+	}
+	if err := client.Rename(src, dst); err != nil {
+		if rerr := client.Rename(aside, dst); rerr != nil {
+			return fmt.Errorf("%w; the previous %q could not be restored and is at %q: %w", err, dst, aside, rerr)
+		}
+		return err
+	}
+	s.removeQuietly(client, aside)
+	return nil
+}
+
+// removeQuietly removes a leftover temporary file, logging any failure.
+func (s *Storage) removeQuietly(client SFTPClient, p string) {
+	if err := client.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.logger.Warn("error removing temporary file", "path", p, "error", err)
+	}
+}
+
 func (s *Storage) Delete(ctx context.Context, filePaths ...string) error {
 	client, err := s.sftpLazy.Client(ctx)
 	if err != nil {
@@ -423,6 +567,13 @@ func (s *Storage) Delete(ctx context.Context, filePaths ...string) error {
 		}
 	}
 	return nil
+}
+
+// CopyAll copies every object under srcPrefix to dstPrefix with storages.CopyEach.
+func (s *Storage) CopyAll(
+	ctx context.Context, srcPrefix, dstPrefix string, opts ...storages.CopyAllOption,
+) (storages.CopyStat, error) {
+	return storages.CopyEach(ctx, s, srcPrefix, dstPrefix, opts...)
 }
 
 func (s *Storage) DeleteAll(ctx context.Context, pathPrefix string) error {

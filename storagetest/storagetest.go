@@ -38,6 +38,7 @@ import (
 	"io"
 	"slices"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/greenmaskio/storages"
@@ -74,6 +75,25 @@ func Run(t *testing.T, newStorage func(t *testing.T) storages.Storager) {
 		}
 		if got := mustGet(t, st, "a/b/c.txt"); !bytes.Equal(got, content) {
 			t.Errorf("GetObject = %q, want %q", got, content)
+		}
+	})
+
+	t.Run("PutFailedReadKeepsPrevious", func(t *testing.T) {
+		st := newStorage(t)
+		put(t, st, "obj.txt", "old")
+		body := io.MultiReader(bytes.NewReader([]byte("new-partial")), iotest.ErrReader(errors.New("boom")))
+		if err := st.PutObject(context.Background(), "obj.txt", body); err == nil {
+			t.Fatal("PutObject with a failing body = nil, want an error")
+		}
+		if got := string(mustGet(t, st, "obj.txt")); got != "old" {
+			t.Errorf("GetObject = %q, want %q", got, "old")
+		}
+		objects, err := st.List(context.Background(), "")
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if got := names(objects); !slices.Equal(got, []string{"obj.txt"}) {
+			t.Errorf("List = %v, want [obj.txt]", got)
 		}
 	})
 

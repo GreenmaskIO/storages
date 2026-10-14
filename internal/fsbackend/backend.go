@@ -260,6 +260,10 @@ func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectSta
 
 	res := []storages.ObjectStat{}
 	err = afero.Walk(s.fs, native(root), func(p string, info fs.FileInfo, err error) error {
+		// A put renames its temporary file away mid-walk; skip what vanished.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -294,50 +298,35 @@ func (s *Storage) List(ctx context.Context, prefix string) ([]storages.ObjectSta
 	return res, nil
 }
 
+// PutObject writes body to a temporary file and renames it over filePath.
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
 	fullPath := path.Join(s.cwd, toSlash(filePath))
-	if dir := path.Dir(fullPath); dir != "" {
-		if err := s.fs.MkdirAll(native(dir), s.dirMode); err != nil {
-			return fmt.Errorf("error creating directory: %w", err)
-		}
+	dir := native(path.Dir(fullPath))
+	if err := s.fs.MkdirAll(dir, s.dirMode); err != nil {
+		return fmt.Errorf("error creating directory: %w", err)
+	}
+	if info, err := s.fs.Stat(native(fullPath)); err == nil && info.IsDir() {
+		return fmt.Errorf("put destination %s is a directory", filePath)
 	}
 
-	f, err := s.fs.Create(native(fullPath))
+	tmp, err := afero.TempFile(s.fs, dir, ".copy-*")
 	if err != nil {
 		return fmt.Errorf("unable to create file: %w", err)
 	}
+	tmpName := tmp.Name()
 
-	// Copy in a goroutine so a cancelled context returns promptly. The goroutine
-	// owns the file handle and closes it itself, so returning on ctx.Done() never
-	// races with the in-flight io.Copy (write-after-close). The channel is
-	// buffered so the goroutine can always finish and never leaks.
-	done := make(chan error, 1)
-	go func() {
-		_, copyErr := io.Copy(f, body)
-		if cerr := f.Close(); cerr != nil {
-			if copyErr == nil {
-				copyErr = cerr
-			} else if s.logger != nil {
-				s.logger.Warn("error closing file", "path", fullPath, "error", cerr)
-			}
-		}
-		done <- copyErr
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("error writing data: %w", err)
-		}
+	_, err = io.Copy(tmp, ctxReader{ctx: ctx, r: body})
+	if cerr := tmp.Close(); err == nil && cerr != nil {
+		err = cerr
+	}
+	if err != nil {
+		s.removeQuietly(tmpName)
+		return fmt.Errorf("error writing data: %w", err)
 	}
 
-	// Apply the configured file mode explicitly: afero.Fs.Create uses a fixed
-	// default, so without this s.fileMode would be dead configuration. On Windows
-	// Chmod only honors the write bit, which is acceptable.
-	if err := s.fs.Chmod(native(fullPath), s.fileMode); err != nil {
-		return fmt.Errorf("error setting file mode: %w", err)
+	if err := s.renameIntoPlace(tmpName, native(fullPath)); err != nil {
+		s.removeQuietly(tmpName)
+		return err
 	}
 	return nil
 }
@@ -399,14 +388,22 @@ func (s *Storage) fillAndRename(ctx context.Context, tmp, src afero.File, dst st
 	if err != nil {
 		return 0, err
 	}
-	// afero.TempFile creates the file 0600.
-	if err := s.fs.Chmod(tmp.Name(), s.fileMode); err != nil {
-		return 0, fmt.Errorf("error setting file mode: %w", err)
-	}
-	if err := s.fs.Rename(tmp.Name(), dst); err != nil {
-		return 0, fmt.Errorf("error moving copy into place: %w", err)
+	if err := s.renameIntoPlace(tmp.Name(), dst); err != nil {
+		return 0, err
 	}
 	return n, nil
+}
+
+// renameIntoPlace applies the configured file mode to tmp, which afero.TempFile
+// creates 0600, and renames it over dst. On Windows Chmod honors only the write bit.
+func (s *Storage) renameIntoPlace(tmp, dst string) error {
+	if err := s.fs.Chmod(tmp, s.fileMode); err != nil {
+		return fmt.Errorf("error setting file mode: %w", err)
+	}
+	if err := s.fs.Rename(tmp, dst); err != nil {
+		return fmt.Errorf("error moving file into place: %w", err)
+	}
+	return nil
 }
 
 // writeAll copies src into dst and closes both. A cancelled ctx closes src to
@@ -438,7 +435,20 @@ func (s *Storage) writeAll(ctx context.Context, dst, src afero.File) (int64, err
 	return r.n, r.err
 }
 
-// removeQuietly removes a leftover temporary copy at the native path p.
+// ctxReader fails reads once ctx ends, which is how a put is cancelled.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// removeQuietly removes a leftover temporary file at the native path p.
 func (s *Storage) removeQuietly(p string) {
 	if err := s.fs.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) && s.logger != nil {
 		s.logger.Warn("error removing temporary copy", "path", p, "error", err)

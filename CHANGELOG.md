@@ -8,6 +8,22 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
+## [Unreleased]
+
+### Fixed
+
+- `PutObject` on the directory, in-memory and SSH storages writes a hidden
+  `.copy-*` temporary file and renames it into place, so a failed or cancelled
+  put leaves the previous object intact instead of truncated. A killed put can
+  leave the `.copy-*` file behind. A directory destination is refused. The file
+  is replaced rather than written into, so its mode and owner are not kept and
+  a symlink is replaced.
+- A cancelled `PutObject` on those storages stops reading the body and returns
+  only once the temporary file is removed, instead of leaving a goroutine
+  reading it.
+- `List` on the directory and in-memory storages no longer fails when a
+  concurrent put or copy renames its temporary file away mid-walk.
+
 ## [0.3.3] - 2026-10-13
 
 ### Added

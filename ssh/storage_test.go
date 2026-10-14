@@ -29,6 +29,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/greenmaskio/storages"
 	"github.com/pkg/sftp"
@@ -334,6 +335,47 @@ func TestStorage_Copy(t *testing.T) {
 		require.ErrorContains(t, err, "is a directory")
 
 		assert.Equal(t, []string{"dir/a.txt", "src.txt"}, names(t, st))
+	})
+}
+
+func TestStorage_PutObject(t *testing.T) {
+	ctx := context.Background()
+
+	names := func(t *testing.T, st storages.Storager) []string {
+		t.Helper()
+		objects, err := st.List(ctx, "")
+		require.NoError(t, err)
+		var res []string
+		for _, o := range objects {
+			res = append(res, o.Name)
+		}
+		return res
+	}
+
+	t.Run("a failed read keeps the previous object", func(t *testing.T) {
+		st := newLocalStorage(t)
+		putObject(t, st, "obj.txt", []byte("old"))
+
+		boom := errors.New("boom")
+		body := io.MultiReader(strings.NewReader("new-partial"), iotest.ErrReader(boom))
+		require.ErrorIs(t, st.PutObject(ctx, "obj.txt", body), boom)
+
+		assert.Equal(t, "old", readObject(t, st, "obj.txt"))
+		assert.Equal(t, []string{"obj.txt"}, names(t, st))
+	})
+
+	t.Run("a cancelled put keeps the previous object", func(t *testing.T) {
+		st := newLocalStorage(t)
+		putObject(t, st, "obj.txt", []byte("old"))
+
+		cctx, cancel := context.WithCancel(ctx)
+		cancel()
+		pr, pw := io.Pipe() // never written: a read would block forever
+		defer func() { require.NoError(t, pw.Close()) }()
+		require.ErrorIs(t, st.PutObject(cctx, "obj.txt", pr), context.Canceled)
+
+		assert.Equal(t, []string{"obj.txt"}, names(t, st), "the temporary file is removed")
+		assert.Equal(t, "old", readObject(t, st, "obj.txt"))
 	})
 }
 

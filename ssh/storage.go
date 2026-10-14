@@ -343,6 +343,7 @@ func listUnder(ctx context.Context, client SFTPClient, dir, rel string, res *[]s
 	return nil
 }
 
+// PutObject streams body into a temporary sibling and renames it over filePath.
 func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader) error {
 	client, err := s.sftpLazy.Client(ctx)
 	if err != nil {
@@ -354,37 +355,23 @@ func (s *Storage) PutObject(ctx context.Context, filePath string, body io.Reader
 	if err = client.MkdirAll(dirPath); err != nil {
 		return fmt.Errorf("create directory %q via SFTP: %w", dirPath, err)
 	}
+	// A rename would move a destination directory aside, or replace it if empty.
+	if info, err := client.Stat(absolutePath); err == nil && info.IsDir() {
+		return fmt.Errorf("put destination %q is a directory", absolutePath)
+	}
 
-	file, err := client.Create(absolutePath)
+	tmpFull, err := tempSibling(absolutePath)
 	if err != nil {
-		return fmt.Errorf("create file %q via SFTP: %w", absolutePath, err)
+		return err
+	}
+	tmp, err := client.Create(tmpFull)
+	if err != nil {
+		return fmt.Errorf("create file %q via SFTP: %w", tmpFull, err)
 	}
 
-	done := make(chan struct{})
-	var copyErr error
-	go func() {
-		_, copyErr = io.Copy(file, body)
-		close(done)
-	}()
-
-	select {
-	case <-ctx.Done():
-		if cerr := file.Close(); cerr != nil {
-			s.logger.Warn("error closing file after context cancellation", "path", absolutePath, "error", cerr)
-		}
-		return ctx.Err()
-	case <-done:
-	}
-
-	if copyErr != nil {
-		if cerr := file.Close(); cerr != nil {
-			s.logger.Warn("error closing file after failed write", "path", absolutePath, "error", cerr)
-		}
-		return fmt.Errorf("write data to file %q via SFTP: %w", absolutePath, copyErr)
-	}
-
-	if err = file.Close(); err != nil {
-		return fmt.Errorf("close file %q opened via SFTP: %w", absolutePath, err)
+	if _, err := s.fillAndReplace(ctx, client, tmp, ctxReader{ctx: ctx, r: body}, absolutePath); err != nil {
+		s.removeQuietly(client, tmpFull)
+		return fmt.Errorf("write data to file %q via SFTP: %w", absolutePath, err)
 	}
 	return nil
 }
@@ -468,6 +455,19 @@ func (s *Storage) fillAndReplace(
 		return 0, fmt.Errorf("move copy into place: %w", err)
 	}
 	return n, nil
+}
+
+// ctxReader fails reads once ctx ends, so a cancelled put stops reading body.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // ctxWriter fails writes once ctx ends, which is how a copy is cancelled:

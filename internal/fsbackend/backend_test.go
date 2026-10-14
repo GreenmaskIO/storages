@@ -383,8 +383,8 @@ func TestDeleteAllWriteError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// blockingReader never returns from Read until unblocked, letting us exercise
-// the context-cancellation path of PutObject deterministically.
+// blockingReader never returns from Read until unblocked, so a put that read it
+// after its context ended would hang the test.
 type blockingReader struct {
 	release chan struct{}
 }
@@ -402,10 +402,88 @@ func TestPutObjectContextCancelled(t *testing.T) {
 		cancel() // already cancelled
 
 		r := &blockingReader{release: make(chan struct{})}
-		defer close(r.release) // let the copy goroutine finish after the test
+		defer close(r.release)
 
 		err := s.PutObject(ctx, "f.txt", r)
 		assert.ErrorIs(t, err, context.Canceled)
+	})
+}
+
+// TestPutObjectCancelledKeepsPrevious checks that a cancelled put never touches
+// the existing object and that its temporary file is removed.
+func TestPutObjectCancelledKeepsPrevious(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, mk newStorage) {
+		s, cwd := mk(t)
+		put(t, s, "f.txt", "old")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r := &blockingReader{release: make(chan struct{})}
+		defer close(r.release)
+		require.ErrorIs(t, s.PutObject(ctx, "f.txt", r), context.Canceled)
+
+		entries, err := afero.ReadDir(s.fs, native(cwd))
+		require.NoError(t, err)
+		assert.Len(t, entries, 1, "the temporary file is removed")
+		got, err := read(t, s, "f.txt")
+		require.NoError(t, err)
+		assert.Equal(t, "old", got)
+	})
+}
+
+// cancelOnRead cancels its context on the first Read and keeps serving data.
+type cancelOnRead struct{ cancel context.CancelFunc }
+
+func (c cancelOnRead) Read(p []byte) (int, error) {
+	c.cancel()
+	return copy(p, "chunk"), nil
+}
+
+// TestPutObjectCancelledMidCopy checks that a cancel during the copy stops it at
+// the next read, keeps the previous object and removes the temporary file.
+func TestPutObjectCancelledMidCopy(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, mk newStorage) {
+		s, cwd := mk(t)
+		put(t, s, "f.txt", "old")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		require.ErrorIs(t, s.PutObject(ctx, "f.txt", cancelOnRead{cancel}), context.Canceled)
+
+		entries, err := afero.ReadDir(s.fs, native(cwd))
+		require.NoError(t, err)
+		assert.Len(t, entries, 1, "the temporary file is removed")
+		got, err := read(t, s, "f.txt")
+		require.NoError(t, err)
+		assert.Equal(t, "old", got)
+	})
+}
+
+func TestPutObjectOverDirectoryIsAnError(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, mk newStorage) {
+		s, _ := mk(t)
+		put(t, s, "dir/x.txt", "data")
+
+		require.Error(t, s.PutObject(context.Background(), "dir", bytes.NewReader([]byte("y"))))
+		got, err := read(t, s, "dir/x.txt")
+		require.NoError(t, err)
+		assert.Equal(t, "data", got)
+	})
+}
+
+// TestPutObjectAppliesFileMode checks that a put gets the configured file mode,
+// not the 0600 its temporary file is created with.
+func TestPutObjectAppliesFileMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows keeps only the write bit")
+	}
+	forEachBackend(t, func(t *testing.T, mk newStorage) {
+		s, cwd := mk(t)
+		put(t, s, "dir/f.txt", "abc")
+
+		info, err := s.fs.Stat(native(path.Join(cwd, "dir/f.txt")))
+		require.NoError(t, err)
+		assert.Equal(t, FileMode, info.Mode().Perm())
 	})
 }
 
@@ -509,4 +587,31 @@ func TestCopyCancelledMidCopyLeavesNoTemporary(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	assert.Equal(t, []string{"src.txt"}, names, "no temporary and no destination are left")
+}
+
+// vanishingFs reports a file as gone when walked, as when a put renames its
+// temporary file away between the directory read and the stat.
+type vanishingFs struct {
+	afero.Fs
+	name string
+}
+
+func (v vanishingFs) Stat(name string) (os.FileInfo, error) {
+	if filepath.Base(name) == v.name {
+		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
+	}
+	return v.Fs.Stat(name)
+}
+
+func TestListSkipsFilesThatVanishMidWalk(t *testing.T) {
+	mem := afero.NewMemMapFs()
+	require.NoError(t, mem.MkdirAll("/root", DirMode))
+	s := New(vanishingFs{Fs: mem, name: ".copy-1"}, "/root")
+	put(t, s, "a.txt", "a")
+	require.NoError(t, afero.WriteFile(mem, "/root/.copy-1", []byte("tmp"), FileMode))
+
+	objects, err := s.List(context.Background(), "")
+	require.NoError(t, err)
+	require.Len(t, objects, 1)
+	assert.Equal(t, "a.txt", objects[0].Name)
 }

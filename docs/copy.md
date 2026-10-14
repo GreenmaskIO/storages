@@ -33,7 +33,8 @@ same storage, overwriting the destination.
 - **Directory, in-memory, SSH:** the destination file is replaced, so its mode
   and owner are not kept and a symlink is replaced rather than written through.
   A directory destination is refused. A hidden `.copy-*` file is left behind if
-  the process is killed mid-copy.
+  the process is killed mid-copy. `PutObject` writes the same way, with the same
+  effects.
 - **S3:** the copy is written with the storage's configured storage class and
   SSE, as `PutObject` would write it. Above 5 GiB it keeps the source's content
   headers, metadata and tags, as `CopyObject` does below it. The copy is pinned

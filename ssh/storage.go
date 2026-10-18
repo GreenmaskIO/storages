@@ -81,15 +81,17 @@ func WithUnsafe() Option {
 	}
 }
 
-// New builds an SSH/SFTP backend from cfg. The connection is established
-// lazily on first use (or via Ping). Pass WithLogger to enable diagnostic
+// New builds an SSH/SFTP backend from cfg, after running Config.Validate. The
+// connection is established lazily on first use (or via Ping). Pass WithLogger to enable diagnostic
 // output; without it the backend does not log at all. Call Close on the returned
 // storage when done to release the connection.
 //
 // The returned storage is guarded: keys cannot escape cfg.Prefix. See WithUnsafe
 // to opt out.
 func New(cfg Config, opts ...Option) (storages.Storager, error) {
-	cfg.applyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate ssh config: %w", err)
+	}
 	s := &Storage{
 		cfg: cfg,
 		cwd: cfg.Prefix,
@@ -114,6 +116,7 @@ func New(cfg Config, opts ...Option) (storages.Storager, error) {
 		Auth: authMethods,
 		// TODO: verify host keys when a known_hosts option is added
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         cfg.ConnectTimeout,
 	}
 	address := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
@@ -134,9 +137,9 @@ func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read SSH private key: %w", err)
 		}
-		signer, err := ssh.ParsePrivateKey(pkey)
+		signer, err := parsePrivateKey(pkey, cfg.PrivateKeyPassphrase)
 		if err != nil {
-			return nil, fmt.Errorf("parse SSH private key: %w", err)
+			return nil, err
 		}
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
@@ -144,6 +147,28 @@ func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
 	}
 	return authMethods, nil
+}
+
+// parsePrivateKey decodes an SSH private key, decrypting it with passphrase if
+// it is encrypted. An unencrypted key ignores the passphrase. An encrypted key
+// without a passphrase is named as such.
+func parsePrivateKey(pemBytes []byte, passphrase string) (ssh.Signer, error) {
+	signer, err := ssh.ParsePrivateKey(pemBytes)
+	var missing *ssh.PassphraseMissingError
+	if errors.As(err, &missing) {
+		if passphrase == "" {
+			return nil, fmt.Errorf("parse SSH private key: the key is encrypted, set PrivateKeyPassphrase: %w", err)
+		}
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(pemBytes, []byte(passphrase))
+		if err != nil {
+			return nil, fmt.Errorf("parse SSH private key with passphrase: %w", err)
+		}
+		return signer, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("parse SSH private key: %w", err)
+	}
+	return signer, nil
 }
 
 // Close releases the shared SSH/SFTP connection. It must be called once by the

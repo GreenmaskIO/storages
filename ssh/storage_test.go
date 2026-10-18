@@ -24,12 +24,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/greenmaskio/storages"
 	"github.com/pkg/sftp"
@@ -78,6 +81,16 @@ func TestConfig_Validate(t *testing.T) {
 			wantPort: 22,
 		},
 		{
+			name:    "passphrase without a private key",
+			cfg:     &Config{Host: "h", User: "u", Password: "p", PrivateKeyPassphrase: "s", Port: 22},
+			wantErr: true,
+		},
+		{
+			name:    "negative connect timeout",
+			cfg:     &Config{Host: "h", User: "u", Password: "p", Port: 22, ConnectTimeout: -time.Second},
+			wantErr: true,
+		},
+		{
 			name:     "non-positive port clamps to default",
 			cfg:      &Config{Host: "h", User: "u", Password: "p", Port: 0},
 			wantErr:  false,
@@ -100,6 +113,7 @@ func TestConfig_Validate(t *testing.T) {
 func TestDefaultConfig_Defaults(t *testing.T) {
 	cfg := DefaultConfig()
 	assert.Equal(t, defaultPort, cfg.Port)
+	assert.Equal(t, defaultConnectTimeout, cfg.ConnectTimeout)
 }
 
 func TestBuildAuthMethods(t *testing.T) {
@@ -137,6 +151,35 @@ func TestBuildAuthMethods(t *testing.T) {
 		assert.Error(t, err)
 	})
 
+	t.Run("encrypted key with its passphrase", func(t *testing.T) {
+		encrypted := writeTestPrivateKeyWithPassphrase(t, "s3cret")
+		methods, err := buildAuthMethods(Config{User: "u", PrivateKeyPath: encrypted, PrivateKeyPassphrase: "s3cret"})
+		require.NoError(t, err)
+		require.Len(t, methods, 1)
+		assert.Equal(t, "publickey", reflectMethodName(methods[0]))
+	})
+
+	t.Run("encrypted key without a passphrase says so", func(t *testing.T) {
+		encrypted := writeTestPrivateKeyWithPassphrase(t, "s3cret")
+		_, err := buildAuthMethods(Config{User: "u", PrivateKeyPath: encrypted})
+		var missing *ssh.PassphraseMissingError
+		require.ErrorAs(t, err, &missing)
+		assert.ErrorContains(t, err, "set PrivateKeyPassphrase")
+	})
+
+	t.Run("unencrypted key ignores a passphrase", func(t *testing.T) {
+		methods, err := buildAuthMethods(Config{User: "u", PrivateKeyPath: writeTestPrivateKey(t), PrivateKeyPassphrase: "s3cret"})
+		require.NoError(t, err)
+		require.Len(t, methods, 1)
+		assert.Equal(t, "publickey", reflectMethodName(methods[0]))
+	})
+
+	t.Run("encrypted key with a wrong passphrase errors", func(t *testing.T) {
+		encrypted := writeTestPrivateKeyWithPassphrase(t, "s3cret")
+		_, err := buildAuthMethods(Config{User: "u", PrivateKeyPath: encrypted, PrivateKeyPassphrase: "wrong"})
+		assert.Error(t, err)
+	})
+
 	t.Run("malformed key errors", func(t *testing.T) {
 		bad := path.Join(t.TempDir(), "bad_key")
 		require.NoError(t, os.WriteFile(bad, []byte("not a key"), 0o600))
@@ -168,6 +211,19 @@ func writeTestPrivateKey(t *testing.T) string {
 	block, err := ssh.MarshalPrivateKey(priv, "")
 	require.NoError(t, err)
 	keyPath := path.Join(t.TempDir(), "id_ed25519")
+	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600))
+	return keyPath
+}
+
+// writeTestPrivateKeyWithPassphrase writes an ed25519 OpenSSH private key encrypted
+// with passphrase and returns its path.
+func writeTestPrivateKeyWithPassphrase(t *testing.T, passphrase string) string {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKeyWithPassphrase(priv, "", []byte(passphrase))
+	require.NoError(t, err)
+	keyPath := path.Join(t.TempDir(), "id_ed25519_encrypted")
 	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600))
 	return keyPath
 }
@@ -566,6 +622,41 @@ func (f *renameFS) asideFile(t *testing.T) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func TestNew_validatesConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "missing host", cfg: Config{User: "u", Password: "p"}},
+		{name: "negative connect timeout", cfg: Config{Host: "h", User: "u", Password: "p", ConnectTimeout: -time.Second}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(tt.cfg)
+
+			assert.Error(t, err)
+		})
+	}
+}
+
+// ConnectTimeout reaches the connection: Ping against a host that stalls the
+// handshake ends at it.
+func TestNew_ConnectTimeout(t *testing.T) {
+	addr, _, _ := stallingListener(t)
+	host, portStr, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portStr)
+	require.NoError(t, err)
+	st, err := New(Config{Host: host, Port: port, User: "u", Password: "p", ConnectTimeout: 200 * time.Millisecond})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	err = st.Ping(t.Context())
+
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestStorage_replaceFile(t *testing.T) {

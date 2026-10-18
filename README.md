@@ -187,7 +187,10 @@ st, err := azure.NewStorage(ctx, azure.Config{
 
 Holds a real connection, so `Close()` matters. `SubStorage`
 clones share the connection; closing any closes all. Operations on a closed
-storage return `ssh.ErrStorageClosed`.
+storage return `ssh.ErrStorageClosed`. The connection is opened on first use and
+bounded by the caller's ctx and by `ConnectTimeout` (default 30s): the TCP dial,
+the SSH handshake and the SFTP session start alike. An encrypted private key
+takes `PrivateKeyPassphrase`.
 
 ```go
 st, err := ssh.NewStorage(ssh.Config{

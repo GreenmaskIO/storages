@@ -289,3 +289,181 @@ func TestSFTPLazy_ConcurrentClientAndClose(t *testing.T) {
 		assert.Zero(t, accepted.Load(), "a closed storage must not dial")
 	})
 }
+
+// stallingListener accepts connections and holds them open without a word, the
+// way a host behind a stalled proxy does: an SSH handshake against it never ends.
+// Every accept is also sent on accepts, so a test can act once a dial is in its handshake.
+func stallingListener(t *testing.T) (addr string, accepted *atomic.Int64, accepts <-chan struct{}) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	accepted = &atomic.Int64{}
+	acceptCh := make(chan struct{}, concurrency)
+	var conns []net.Conn
+	var mu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			acceptCh <- struct{}{}
+		}
+	}()
+
+	t.Cleanup(func() {
+		require.NoError(t, ln.Close())
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
+	return ln.Addr().String(), accepted, acceptCh
+}
+
+func newStallingLazy(addr string, timeout time.Duration) *sftpLazy {
+	return newSFTPLazy(addr, &ssh.ClientConfig{
+		User:            "irrelevant",
+		Auth:            []ssh.AuthMethod{ssh.Password("irrelevant")},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         timeout,
+	}, slog.New(slog.DiscardHandler))
+}
+
+// stallingSFTPServer completes the SSH handshake and accepts a session channel,
+// then never answers the sftp subsystem request: the SFTP init against it never ends.
+func stallingSFTPServer(t *testing.T) (addr string) {
+	t.Helper()
+
+	cfg := &ssh.ServerConfig{NoClientAuth: true}
+	cfg.AddHostKey(generateHostKey(t))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	var conns []net.Conn
+	var mu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			go func() {
+				_, chans, reqs, err := ssh.NewServerConn(conn, cfg)
+				if err != nil {
+					return
+				}
+				go ssh.DiscardRequests(reqs)
+				for newChannel := range chans {
+					_, requests, err := newChannel.Accept()
+					if err != nil {
+						return
+					}
+					go func() {
+						for range requests { // never replied to
+						}
+					}()
+				}
+			}()
+		}
+	}()
+
+	t.Cleanup(func() {
+		require.NoError(t, ln.Close())
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
+	return ln.Addr().String()
+}
+
+// ssh.Dial bounds only the TCP connect; the timeout must bound the rest too.
+func TestSFTPLazy_Client_TimeoutBoundsTheConnection(t *testing.T) {
+	tests := []struct {
+		name string
+		addr func(t *testing.T) string
+	}{
+		{
+			name: "stalled SSH handshake",
+			addr: func(t *testing.T) string {
+				addr, _, _ := stallingListener(t)
+				return addr
+			},
+		},
+		{
+			name: "stalled SFTP init",
+			addr: stallingSFTPServer,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lazy := newStallingLazy(tt.addr(t), 200*time.Millisecond)
+
+			_, err := lazy.Client(t.Context())
+
+			assert.ErrorIs(t, err, context.DeadlineExceeded)
+		})
+	}
+}
+
+// A cancelled caller ends the handshake, and its failure is not cached: the host
+// was never judged, so the next caller dials again.
+func TestSFTPLazy_Client_CancelledAttemptIsNotCached(t *testing.T) {
+	addr, accepted, accepts := stallingListener(t)
+	lazy := newStallingLazy(addr, time.Minute)
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-accepts
+		cancel()
+	}()
+	_, err := lazy.Client(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	retryCtx, retryCancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer retryCancel()
+
+	_, err = lazy.Client(retryCtx)
+
+	require.Error(t, err)
+	assert.Equal(t, int64(2), accepted.Load(), "the second call dials again")
+}
+
+// A caller waiting on another's attempt gives up on its own ctx, without dialling.
+func TestSFTPLazy_Client_WaiterHonoursItsCtx(t *testing.T) {
+	addr, accepted, accepts := stallingListener(t)
+	lazy := newStallingLazy(addr, time.Minute)
+	firstCtx, firstCancel := context.WithCancel(t.Context())
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := lazy.Client(firstCtx)
+		firstErr <- err
+	}()
+	<-accepts
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer waitCancel()
+
+	_, waitErr := lazy.Client(waitCtx)
+	firstCancel()
+
+	assert.ErrorIs(t, waitErr, context.DeadlineExceeded)
+	assert.ErrorIs(t, <-firstErr, context.Canceled)
+	assert.Equal(t, int64(1), accepted.Load(), "the waiter must not dial")
+}

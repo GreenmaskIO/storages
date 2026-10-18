@@ -8,6 +8,32 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
+## [0.3.5] - 2026-10-18
+
+### Added
+
+- `ssh.Config.PrivateKeyPassphrase` decrypts an encrypted private key. An
+  encrypted key without one fails with an error naming the missing passphrase.
+  An unencrypted key ignores it.
+- `ssh.Config.ConnectTimeout`, default 30s.
+
+### Changed
+
+- `ssh.New` runs `Config.Validate`, like `s3.New`, so an incomplete config or a
+  negative `ConnectTimeout` fails there instead of at the first operation.
+
+### Fixed
+
+- The SSH connection honours the caller's ctx and `ConnectTimeout` for the TCP
+  dial, the handshake and the SFTP session start alike. Before, the dial
+  ignored ctx and had no timeout, so an unreachable or stalling host blocked the
+  first operation, `Ping` included, until the OS gave up, and cancelling did
+  nothing.
+- A caller waiting on another's connection attempt gives up when its own ctx is
+  done.
+- A connection attempt cut short by its caller's ctx is no longer cached as the
+  storage's failure; the next operation dials again.
+
 ## [0.3.4] - 2026-10-14
 
 ### Fixed

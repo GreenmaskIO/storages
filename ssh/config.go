@@ -14,17 +14,25 @@
 
 package ssh
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
-const defaultPort = 22
+const (
+	defaultPort           = 22
+	defaultConnectTimeout = 30 * time.Second
+)
 
 type Config struct {
-	Host           string // required
-	Port           int    // default 22
-	User           string // required
-	Password       string // auth: password
-	PrivateKeyPath string // auth: private key
-	Prefix         string // remote root path
+	Host                 string        // required
+	Port                 int           // default 22
+	User                 string        // required
+	Password             string        // auth: password
+	PrivateKeyPath       string        // auth: private key
+	PrivateKeyPassphrase string        // decrypts an encrypted private key
+	Prefix               string        // remote root path
+	ConnectTimeout       time.Duration // bounds the TCP dial and the SSH handshake, default 30s
 }
 
 // DefaultConfig returns a Config populated with sensible defaults. Set the
@@ -43,6 +51,9 @@ func (c *Config) applyDefaults() {
 	if c.Port == 0 {
 		c.Port = defaultPort
 	}
+	if c.ConnectTimeout == 0 {
+		c.ConnectTimeout = defaultConnectTimeout
+	}
 }
 
 func (c *Config) Validate() error {
@@ -55,6 +66,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Password == "" && c.PrivateKeyPath == "" {
 		return fmt.Errorf("one of password or private_key_path is required")
+	}
+	if c.PrivateKeyPassphrase != "" && c.PrivateKeyPath == "" {
+		return fmt.Errorf("private_key_passphrase requires private_key_path")
+	}
+	if c.ConnectTimeout < 0 {
+		return fmt.Errorf("connect_timeout must not be negative")
 	}
 	return nil
 }

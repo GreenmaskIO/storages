@@ -24,6 +24,8 @@ Extracted from [greenmask](https://github.com/greenmaskio/greenmask).
 | [SSH/SFTP](#sshsftp) | [`ssh`](ssh) | Remote host over SFTP |
 | [In-memory](#in-memory) | [`inmemory`](inmemory) | Tests — no I/O, no services |
 
+Any of them can be wrapped by [`encrypted`](#client-side-encryption).
+
 Need something else? See [Writing your own backend](#writing-your-own-backend).
 
 ## Install
@@ -208,6 +210,34 @@ A full, conformant backend for tests; no I/O, no services:
 ```go
 st := inmemory.New("")
 ```
+
+## Client-side encryption
+
+`encrypted.New` wraps any storage so that every object it writes is an
+[age](https://age-encryption.org) file encrypted to one X25519 identity, and
+every object it reads is decrypted. Keys, listings and the directory tree pass
+through unchanged; `Stat`, `List` and `CopyStat.Bytes` report plaintext sizes.
+
+```go
+identity, _ := age.GenerateX25519Identity() // keep it: nothing decrypts without it
+st, err := encrypted.New(s3Storage, identity)
+```
+
+- **Range reads stay cheap.** `GetObjectRange` decrypts only the 64 KiB chunks
+  the range covers: an object of up to 1 MiB is fetched whole, a larger one as
+  its header, its final chunk (which authenticates the size) and the chunks the
+  range needs. With the `Stat` that sizes it, a read costs two requests on a
+  small object and three or four on a large one.
+- **Copies stay server-side.** A ciphertext does not depend on its key, so
+  `Copy` and `CopyAll` copy it as is; `CopyAll` reaches a backend's own listed
+  copy (`storages.ListedCopier`, which S3 implements) per object.
+- **One identity per storage.** The plaintext size is computed from the stored
+  size, which holds only for objects with one X25519 recipient.
+- **Every object is a standard age file**: `age -d -i key.txt` decrypts one.
+- An object of another identity is `encrypted.ErrNoKey`; one truncated, altered
+  or never encrypted is `encrypted.ErrCorruptObject`. A stored size no age file
+  can have is reported as is.
+- Encryption hides contents, not object names, sizes or timestamps.
 
 ## Writing your own backend
 

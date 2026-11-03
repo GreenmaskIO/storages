@@ -238,6 +238,12 @@ func (o CopyAllOptions) copyOptions() []CopyOption {
 // ObjectCopyFunc copies one listed object; obj is what the listing reported.
 type ObjectCopyFunc func(ctx context.Context, obj ObjectStat, srcPath, dstPath string, opts ...CopyOption) (CopyStat, error)
 
+// ListedCopier is a store that copies one object off what a listing reported of
+// it, as its own CopyAll does; a decorator's CopyAll reaches it per object.
+type ListedCopier interface {
+	CopyListedObject(ctx context.Context, obj ObjectStat, srcPath, dstPath string, opts ...CopyOption) (CopyStat, error)
+}
+
 // CopyEach implements Copier.CopyAll with st's List and Copy.
 func CopyEach(ctx context.Context, st Storager, srcPrefix, dstPrefix string, opts ...CopyAllOption) (CopyStat, error) {
 	copyObject := func(ctx context.Context, _ ObjectStat, srcPath, dstPath string, o ...CopyOption) (CopyStat, error) {

@@ -8,6 +8,17 @@ The release workflow extracts the section matching the pushed tag and uses it
 as the body of the draft GitHub release, so every released version must have a
 `## [x.y.z]` section here before tagging.
 
+## [Unreleased]
+
+### Added
+
+- `encrypted.New` wraps a storage with client-side encryption: every object is
+  an age file encrypted to one X25519 identity. Sizes are reported in plaintext,
+  `GetObjectRange` reads only the chunks a range covers, and copies stay
+  server-side. `encrypted.ErrNoKey` and `encrypted.ErrCorruptObject` report an
+  object it cannot decrypt.
+- `filippo.io/age` joins the module's dependencies.
+
 ## [0.3.5] - 2026-10-18
 
 ### Added

@@ -223,6 +223,17 @@ identity, _ := age.GenerateX25519Identity() // keep it: nothing decrypts without
 st, err := encrypted.New(s3Storage, identity)
 ```
 
+**Keys.** The identity is one line, `AGE-SECRET-KEY-1...`; whoever holds it
+both writes and reads. Generate it once with `age-keygen -o storage.key` (or
+`age.GenerateX25519Identity()` on first start) and keep the file like a
+password: it cannot be recovered, and without it the objects are noise. On
+every start load it with `age.ParseIdentities` and hand the `*age.X25519Identity`
+to `encrypted.New`; the file also works with the age CLI, so an object stays
+readable without your program. The public key (`age1...`, `Recipient()`) is safe
+to log and lets a start-up check confirm the right key was supplied.
+Runnable example, including the key file's format and loading:
+[`examples/encrypted_key_file`](examples/encrypted_key_file).
+
 - **Range reads stay cheap.** `GetObjectRange` decrypts only the 64 KiB chunks
   the range covers: an object of up to 1 MiB is fetched whole, a larger one as
   its header, its final chunk (which authenticates the size) and the chunks the

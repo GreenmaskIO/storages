@@ -45,10 +45,7 @@ import (
 )
 
 // Compile-time check that Storage implements the Storager interface.
-var (
-	_ storages.Storager     = (*Storage)(nil)
-	_ storages.ListedCopier = (*Storage)(nil)
-)
+var _ storages.Storager = (*Storage)(nil)
 
 const DefaultS3ObjectsDelimiter = "/"
 
@@ -775,12 +772,12 @@ func (s *Storage) deleteKnown(ctx context.Context, filePaths ...string) error {
 func (s *Storage) CopyAll(
 	ctx context.Context, srcPrefix, dstPrefix string, opts ...storages.CopyAllOption,
 ) (storages.CopyStat, error) {
-	return storages.CopyListed(ctx, s, srcPrefix, dstPrefix, s.CopyListedObject, opts...)
+	return storages.CopyListed(ctx, s, srcPrefix, dstPrefix, s.copyListed, opts...)
 }
 
-// CopyListedObject copies a listed object with one CopyObject pinned to its listed
+// copyListed copies a listed object with one CopyObject pinned to its listed
 // ETag, falling back to Copy when the listing is stale or not enough.
-func (s *Storage) CopyListedObject(
+func (s *Storage) copyListed(
 	ctx context.Context, obj storages.ObjectStat, srcPath, dstPath string, opts ...storages.CopyOption,
 ) (storages.CopyStat, error) {
 	srcKey, dstKey := path.Join(s.prefix, srcPath), path.Join(s.prefix, dstPath)

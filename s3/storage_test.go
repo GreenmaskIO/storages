@@ -1446,9 +1446,9 @@ func TestCopyAll_MoreThanOneListPage(t *testing.T) {
 	}
 }
 
-// TestStorage_CopyListedObject checks that a listed object is copied without a HEAD
+// TestStorage_copyListed checks that a listed object is copied without a HEAD
 // unless its listing is stale or not enough to copy it.
-func TestStorage_CopyListedObject(t *testing.T) {
+func TestStorage_copyListed(t *testing.T) {
 	const listedETag, headETag = `"listed"`, `"current"`
 	listed := func(size int64) storages.ObjectStat {
 		return storages.ObjectStat{Name: "a.txt", Size: size, ETag: listedETag, Exist: true}
@@ -1464,7 +1464,7 @@ func TestStorage_CopyListedObject(t *testing.T) {
 		st := newStorage(t, "dumps/", svc, nil)
 
 		// Act
-		stat, err := st.CopyListedObject(context.Background(), listed(7), "a.txt", "b.txt")
+		stat, err := st.copyListed(context.Background(), listed(7), "a.txt", "b.txt")
 
 		// Assert
 		require.NoError(t, err)
@@ -1484,7 +1484,7 @@ func TestStorage_CopyListedObject(t *testing.T) {
 		st := newStorage(t, "dumps/", svc, nil)
 
 		// Act
-		stat, err := st.CopyListedObject(context.Background(), listed(7), "a.txt", "b.txt")
+		stat, err := st.copyListed(context.Background(), listed(7), "a.txt", "b.txt")
 
 		// Assert
 		require.NoError(t, err)
@@ -1500,7 +1500,7 @@ func TestStorage_CopyListedObject(t *testing.T) {
 		st := newStorage(t, "dumps/", svc, nil)
 
 		// Act
-		_, err := st.CopyListedObject(context.Background(), listed(7), "a.txt", "b.txt")
+		_, err := st.copyListed(context.Background(), listed(7), "a.txt", "b.txt")
 
 		// Assert
 		require.ErrorIs(t, err, storages.ErrFileNotFound)
@@ -1524,7 +1524,7 @@ func TestStorage_CopyListedObject(t *testing.T) {
 			st := newStorage(t, "dumps/", svc, nil)
 
 			// Act
-			_, err := st.CopyListedObject(context.Background(), tc.obj, tc.src, tc.dst)
+			_, err := st.copyListed(context.Background(), tc.obj, tc.src, tc.dst)
 
 			// Assert
 			require.NoError(t, err)
@@ -1540,7 +1540,7 @@ func TestStorage_CopyListedObject(t *testing.T) {
 		st := newStorage(t, "dumps/", svc, nil)
 
 		// Act
-		_, err := st.CopyListedObject(context.Background(), listed(maxCopyObjectSize+1), "a.txt", "b.txt")
+		_, err := st.copyListed(context.Background(), listed(maxCopyObjectSize+1), "a.txt", "b.txt")
 
 		// Assert
 		require.ErrorContains(t, err, "stop here")

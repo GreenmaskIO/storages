@@ -229,8 +229,7 @@ st, err := encrypted.New(s3Storage, identity)
   range needs, one request each. With the `Stat` that sizes it, a read costs
   two requests on a small object and four on a large one.
 - **Copies stay server-side.** A ciphertext does not depend on its key, so
-  `Copy` and `CopyAll` copy it as is; `CopyAll` reaches a backend's own listed
-  copy (`storages.ListedCopier`, which S3 implements) per object.
+  `Copy` and `CopyAll` copy it as is.
 - **One identity per storage.** The plaintext size is computed from the stored
   size, which holds only for objects with one X25519 recipient.
 - **Every object is a standard age file**: `age -d -i key.txt` decrypts one.

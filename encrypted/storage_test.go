@@ -277,26 +277,6 @@ func TestStorage_CopyAll(t *testing.T) {
 	assert.Equal(t, content, readAll(t, sub, "obj"))
 }
 
-func TestStorage_CopyAll_ListedCopy(t *testing.T) {
-	// Arrange
-	inner := &listedStorage{Storager: inmemory.New("")}
-	st := newTestStorage(t, inner)
-	contents := map[string][]byte{"a/x": newContent(chunkSize + 1), "a/y": newContent(10)}
-	for key, content := range contents {
-		require.NoError(t, st.PutObject(t.Context(), key, bytes.NewReader(content)))
-	}
-
-	// Act
-	copied, err := st.CopyAll(t.Context(), "a", "b")
-
-	// Assert
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"b/x", "b/y"}, inner.copied())
-	assert.Equal(t, int64(chunkSize+11), copied.Bytes)
-	assert.Equal(t, 2, copied.Objects)
-	assert.Equal(t, contents["a/x"], readAll(t, st, "b/x"))
-}
-
 func TestStorage_GetObjectRange_CloseEndsABlockedRead(t *testing.T) {
 	// Arrange
 	const size = 3 * wholeObjectSize
@@ -623,28 +603,6 @@ func (r *recordingStorage) requests() []rangeRequest {
 func encryptedSize(l layout, plain int64) int64 {
 	chunks := max((plain+chunkSize-1)/chunkSize, 1)
 	return l.payloadOffset + plain + chunks*tagSize
-}
-
-// listedStorage records the listed copies a CopyAll reaches it with.
-type listedStorage struct {
-	storages.Storager
-	mu   sync.Mutex
-	dsts []string
-}
-
-func (l *listedStorage) CopyListedObject(
-	ctx context.Context, _ storages.ObjectStat, srcPath, dstPath string, opts ...storages.CopyOption,
-) (storages.CopyStat, error) {
-	l.mu.Lock()
-	l.dsts = append(l.dsts, dstPath)
-	l.mu.Unlock()
-	return l.Copy(ctx, srcPath, dstPath, opts...)
-}
-
-func (l *listedStorage) copied() []string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.dsts
 }
 
 // blockingStorage hands out a range body at blockAt that blocks until it is closed.

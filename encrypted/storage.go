@@ -253,25 +253,11 @@ func (s *Storage) Copy(
 	return s.plainCopyStat(stat), nil
 }
 
-// CopyAll copies every object under srcPrefix as Copy does, through the store's
-// listed copy where it has one.
+// CopyAll copies every object under srcPrefix as Copy does.
 func (s *Storage) CopyAll(
 	ctx context.Context, srcPrefix, dstPrefix string, opts ...storages.CopyAllOption,
 ) (storages.CopyStat, error) {
-	copyObject := func(
-		ctx context.Context, obj storages.ObjectStat, srcPath, dstPath string, o ...storages.CopyOption,
-	) (storages.CopyStat, error) {
-		listed, ok := s.store.(storages.ListedCopier)
-		if !ok {
-			return s.Copy(ctx, srcPath, dstPath, o...)
-		}
-		stat, err := listed.CopyListedObject(ctx, obj, srcPath, dstPath, o...)
-		if err != nil {
-			return storages.CopyStat{}, err
-		}
-		return s.plainCopyStat(stat), nil
-	}
-	return storages.CopyListed(ctx, s.store, srcPrefix, dstPrefix, copyObject, opts...)
+	return storages.CopyEach(ctx, s, srcPrefix, dstPrefix, opts...)
 }
 
 func (s *Storage) Ping(ctx context.Context) error { return s.store.Ping(ctx) }

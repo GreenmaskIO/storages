@@ -54,10 +54,7 @@ func Guard(store Storager) Storager {
 // build until it is gated.
 type guard struct{ store Storager }
 
-var (
-	_ Storager     = (*guard)(nil)
-	_ ListedCopier = (*guard)(nil)
-)
+var _ Storager = (*guard)(nil)
 
 func (g *guard) GetCwd() string { return g.store.GetCwd() }
 
@@ -152,25 +149,6 @@ func (g *guard) CopyAll(ctx context.Context, srcPrefix, dstPrefix string, opts .
 		return CopyStat{}, err
 	}
 	return g.store.CopyAll(ctx, src, dst, opts...)
-}
-
-// CopyListedObject gates both keys, then copies through the backend's listed copy,
-// or its Copy when it has none.
-func (g *guard) CopyListedObject(
-	ctx context.Context, obj ObjectStat, srcPath, dstPath string, opts ...CopyOption,
-) (CopyStat, error) {
-	src, err := objectKey(srcPath)
-	if err != nil {
-		return CopyStat{}, err
-	}
-	dst, err := objectKey(dstPath)
-	if err != nil {
-		return CopyStat{}, err
-	}
-	if listed, ok := g.store.(ListedCopier); ok {
-		return listed.CopyListedObject(ctx, obj, src, dst, opts...)
-	}
-	return g.store.Copy(ctx, src, dst, opts...)
 }
 
 func (g *guard) Exists(ctx context.Context, fileName string) (bool, error) {

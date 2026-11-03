@@ -10,6 +10,8 @@ as the body of the draft GitHub release, so every released version must have a
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-03
+
 ### Added
 
 - `encrypted.New` wraps a storage with client-side encryption: every object is

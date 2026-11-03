@@ -14,6 +14,31 @@
 
 package encrypted
 
+// Range reads.
+//
+// An age file is a text header (the file key wrapped to the recipient), a 16-byte
+// nonce, then the payload: 64 KiB chunks of ChaCha20-Poly1305, each followed by a
+// 16-byte tag. A chunk authenticates only as a whole, so a plaintext range is served
+// by decrypting every chunk it touches.
+//
+// age.DecryptReaderAt touches three regions of the ciphertext, in this order:
+//
+//  1. the header, read through a 4 KiB bufio buffer at offset 0; the nonce comes
+//     out of the same buffer;
+//  2. the final chunk, decrypted at open: its nonce carries the last-chunk flag,
+//     which is how a truncated object is refused before any byte is served;
+//  3. the chunks the range covers, one full chunk per ReadAt, in increasing order,
+//     never backwards (the reader keeps a one-chunk cache for a read that ends
+//     mid-chunk).
+//
+// chunkSource fetches 1 and 2 into memory when it opens, and opens 3 as one forward
+// stream that it reads as age asks. That is one request per region, decided up
+// front, with at most 4 KiB + one chunk held in memory however long the range is.
+// An object of up to wholeObjectSize is cheaper to fetch whole, in one request.
+//
+// The forward stream relies on age reading chunk offsets in non-decreasing order; a
+// read behind the stream's position is a bug, not a case to serve, and fails loudly.
+
 import (
 	"bytes"
 	"context"
@@ -21,8 +46,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"sync"
 
 	"github.com/greenmaskio/storages"
 )
@@ -33,38 +56,26 @@ const (
 	wholeObjectSize = 1 << 20
 	// headerReadSize is what age reads at offset 0 to parse a header.
 	headerReadSize = 4096
-	// maxGap is the most a range read skips by reading through rather than by
-	// opening another request.
-	maxGap = 256 << 10
 )
 
 // rangeSource is the ciphertext age decrypts a range from.
 type rangeSource interface {
 	io.ReaderAt
 	io.Closer
-	// sourceErr is the store's own failure, if a read met one.
+	// sourceErr returns a failure that is not the object's: the store's own, or a
+	// read age should never have made.
 	sourceErr() error
 }
 
-// openRangeSource returns the ciphertext source for plaintext [off, end): the
-// whole object when it is small, else one that fetches only what age reads.
+// openRangeSource returns the ciphertext source for plaintext [off, end). A store
+// failure is returned as is; an object shorter than its Stat said is ErrCorruptObject.
 func (s *Storage) openRangeSource(
 	ctx context.Context, key string, encrypted, off, end int64,
 ) (rangeSource, error) {
 	if encrypted <= wholeObjectSize {
 		return s.readWholeSource(ctx, key)
 	}
-	bodyStart, bodyEnd := s.layout.chunkSpan(off, end, encrypted)
-	return &chunkSource{
-		ctx:       ctx,
-		store:     s.store,
-		key:       key,
-		size:      encrypted,
-		tailStart: s.layout.finalChunkOffset(encrypted),
-		bodyStart: bodyStart,
-		bodyEnd:   bodyEnd,
-		logger:    s.logger,
-	}, nil
+	return s.openChunkSource(ctx, key, encrypted, off, end)
 }
 
 func (s *Storage) readWholeSource(ctx context.Context, key string) (rangeSource, error) {
@@ -89,41 +100,88 @@ func (wholeSource) Close() error { return nil }
 
 func (wholeSource) sourceErr() error { return nil }
 
-// chunkSource serves age's reads of one object with as few requests as it can:
-// the final chunk and the header's read kept in memory, everything else through one
-// forward-only stream that reads through a small gap instead of reopening. A
-// header close to the chunks the range needs comes in the same request.
-type chunkSource struct {
-	ctx       context.Context
-	store     storages.Storager
-	key       string
-	size      int64
-	tailStart int64
-	bodyStart int64
-	bodyEnd   int64
-	logger    *slog.Logger
-
-	// mu serialises age's reads.
-	mu     sync.Mutex
-	head   []byte
-	tail   []byte
-	stream *rangeBody
-	pos    int64
-	end    int64
-	err    error
-
-	// streamMu guards replacing the stream against Close, which does not wait for a read.
-	streamMu sync.Mutex
-	closed   bool
+// openChunkSource fetches the header and the final chunk, and opens the chunks
+// of plaintext [off, end) as one stream, cut where the final chunk begins.
+func (s *Storage) openChunkSource(
+	ctx context.Context, key string, encrypted, off, end int64,
+) (rangeSource, error) {
+	bodyStart, bodyEnd := s.layout.chunkSpan(off, end, encrypted)
+	tailStart := s.layout.finalChunkOffset(encrypted)
+	head, err := s.fetch(ctx, key, 0, headerReadSize)
+	if err != nil {
+		return nil, err
+	}
+	tail, err := s.fetch(ctx, key, tailStart, encrypted-tailStart)
+	if err != nil {
+		return nil, err
+	}
+	c := &chunkSource{
+		key:           key,
+		size:          encrypted,
+		payloadOffset: s.layout.payloadOffset,
+		tailStart:     tailStart,
+		streamEnd:     min(bodyEnd, tailStart),
+		head:          head,
+		tail:          tail,
+		pos:           bodyStart,
+		logger:        s.logger,
+	}
+	if bodyStart < c.streamEnd {
+		stream, err := s.store.GetObjectRange(ctx, key, bodyStart, c.streamEnd-bodyStart)
+		if err != nil {
+			return nil, err
+		}
+		c.stream = &rangeBody{ReadCloser: stream}
+	}
+	return c, nil
 }
 
-func (c *chunkSource) ReadAt(p []byte, off int64) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.isClosed() {
-		return 0, fmt.Errorf("read %q: %w", c.key, os.ErrClosed)
+// fetch reads ciphertext [off, off+length) into memory. A short body, or a range the
+// store no longer has, is ErrCorruptObject; a store failure is returned as is.
+func (s *Storage) fetch(ctx context.Context, key string, off, length int64) ([]byte, error) {
+	body, err := s.store.GetObjectRange(ctx, key, off, length)
+	if err != nil {
+		if errors.Is(err, storages.ErrInvalidRange) {
+			return nil, fmt.Errorf("read %d bytes at %d of %q: %w: %w", length, off, key, ErrCorruptObject, err)
+		}
+		return nil, fmt.Errorf("read %q: %w", key, err)
 	}
+	data, err := io.ReadAll(body)
+	if closeErr := body.Close(); closeErr != nil {
+		s.logger.Warn("close object range", "key", key, "error", closeErr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", key, err)
+	}
+	if int64(len(data)) != length {
+		return nil, fmt.Errorf("read %d bytes at %d of %q, got %d: %w", length, off, key, len(data), ErrCorruptObject)
+	}
+	return data, nil
+}
 
+// chunkSource serves age's reads of one large object: the header and the final
+// chunk from memory, the chunks in between from one forward stream.
+type chunkSource struct {
+	key           string
+	size          int64
+	payloadOffset int64
+	// tailStart is where the final chunk, and tail, begin.
+	tailStart int64
+	// streamEnd is where stream ends: the range's last chunk or tailStart, whichever is first.
+	streamEnd int64
+	head      []byte
+	tail      []byte
+	// stream is nil when the range lies within the final chunk.
+	stream *rangeBody
+	// pos is the ciphertext offset stream is at.
+	pos    int64
+	err    error
+	logger *slog.Logger
+}
+
+// ReadAt serves ciphertext [off, off+len(p)) from the head, the stream or the tail,
+// crossing between them as needed. A read behind the stream's position is an error.
+func (c *chunkSource) ReadAt(p []byte, off int64) (int, error) {
 	n := 0
 	for n < len(p) {
 		at := off + int64(n)
@@ -136,11 +194,11 @@ func (c *chunkSource) ReadAt(p []byte, off int64) (int, error) {
 		)
 		switch {
 		case at >= c.tailStart:
-			read, err = c.readTail(p[n:], at)
-		case at < int64(len(c.head)):
+			read = copy(p[n:], c.tail[at-c.tailStart:])
+		case at < c.payloadOffset:
 			read = copy(p[n:], c.head[at:])
 		default:
-			read, err = c.readStream(p[n:int(min(int64(len(p)), c.tailStart-off))], at)
+			read, err = c.readStream(p[n:], at)
 		}
 		n += read
 		if err != nil {
@@ -150,149 +208,55 @@ func (c *chunkSource) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-func (c *chunkSource) readTail(p []byte, at int64) (int, error) {
-	if c.tail == nil {
-		tail, err := c.fetch(c.tailStart, c.size-c.tailStart)
-		if err != nil {
-			return 0, err
-		}
-		c.tail = tail
-	}
-	return copy(p, c.tail[at-c.tailStart:]), nil
-}
-
-func (c *chunkSource) fetch(off, length int64) ([]byte, error) {
-	stream, err := c.store.GetObjectRange(c.ctx, c.key, off, length)
-	if err != nil {
-		return nil, c.fail(err)
-	}
-	body := &rangeBody{ReadCloser: stream}
-	data, err := io.ReadAll(body)
-	c.closeBody(body)
-	if err != nil {
-		return nil, c.failRead(body, err)
-	}
-	if int64(len(data)) != length {
-		return nil, fmt.Errorf("read %d bytes at %d of %q, got %d: %w", length, off, c.key, len(data), io.ErrUnexpectedEOF)
-	}
-	return data, nil
-}
-
+// readStream reads the stream at at, skipping forward to it, up to streamEnd. A store
+// failure is remembered as the source's; a body that ended early is io.ErrUnexpectedEOF.
 func (c *chunkSource) readStream(p []byte, at int64) (int, error) {
-	if c.stream == nil || at < c.pos || at-c.pos > maxGap || at >= c.end {
-		if err := c.openStream(at, len(p)); err != nil {
-			return 0, err
-		}
+	if c.stream == nil || at < c.pos || at >= c.streamEnd {
+		return 0, c.fail(fmt.Errorf("read %q at %d, outside the stream at [%d, %d): %w",
+			c.key, at, c.pos, c.streamEnd, errBackwardRead))
 	}
 	if skip := at - c.pos; skip > 0 {
 		if _, err := io.CopyN(io.Discard, c.stream, skip); err != nil {
-			return 0, c.failRead(c.stream, err)
+			return 0, c.failRead()
 		}
 		c.pos = at
 	}
-	p = p[:min(int64(len(p)), c.end-at)]
+	p = p[:min(int64(len(p)), c.streamEnd-at)]
 	n, err := io.ReadFull(c.stream, p)
 	c.pos += int64(n)
 	if err != nil {
-		return n, c.failRead(c.stream, err)
-	}
-	if at == 0 {
-		// age parses the header through a buffer that reads past it, then
-		// reads the start of the payload again.
-		c.head = bytes.Clone(p[:min(n, headerReadSize)])
+		return n, c.failRead()
 	}
 	return n, nil
 }
 
-// openStream opens the stream at at, to the end of the chunks the range needs
-// when it reads them or lies close enough before them, else for want bytes.
-func (c *chunkSource) openStream(at int64, want int) error {
-	c.dropStream()
-	end := min(at+int64(max(want, headerReadSize)), c.tailStart)
-	if at < c.bodyEnd && c.bodyStart < c.tailStart && c.bodyStart-(at+int64(want)) <= maxGap {
-		end = max(end, min(c.bodyEnd, c.tailStart))
+// errBackwardRead is a read age's order rules out: behind the stream's position or
+// outside the chunks the range covers.
+var errBackwardRead = errors.New("read outside the forward stream")
+
+// failRead classifies a failed stream read: a failure the body returned itself
+// is the store's; a body that ended cleanly short of the range is the object's.
+func (c *chunkSource) failRead() error {
+	if c.stream.err != nil {
+		return c.fail(c.stream.err)
 	}
-	stream, err := c.store.GetObjectRange(c.ctx, c.key, at, end-at)
-	if err != nil {
-		return c.fail(err)
-	}
-	body := &rangeBody{ReadCloser: stream}
-	if !c.setStream(body) {
-		c.closeBody(body)
-		return fmt.Errorf("read %q: %w", c.key, os.ErrClosed)
-	}
-	c.pos, c.end = at, end
-	return nil
+	return fmt.Errorf("read %q: %w", c.key, io.ErrUnexpectedEOF)
 }
 
-func (c *chunkSource) setStream(body *rangeBody) bool {
-	c.streamMu.Lock()
-	defer c.streamMu.Unlock()
-	if c.closed {
-		return false
-	}
-	c.stream = body
-	return true
-}
-
-func (c *chunkSource) dropStream() {
-	c.streamMu.Lock()
-	stream := c.stream
-	c.stream = nil
-	c.streamMu.Unlock()
-	if stream != nil {
-		c.closeBody(stream)
-	}
-}
-
-func (c *chunkSource) isClosed() bool {
-	c.streamMu.Lock()
-	defer c.streamMu.Unlock()
-	return c.closed
-}
-
-// failRead is fail for a read of body: a failure the body itself returned is the store's,
-// however it is spelled; one that ended cleanly short of the range is the object's.
-func (c *chunkSource) failRead(body *rangeBody, err error) error {
-	if body.err != nil {
-		c.err = body.err
-		return body.err
-	}
-	return c.fail(err)
-}
-
-// fail records err as the store's own failure; a read cut short, or past an end that moved, is
-// the object's, as age reports a truncated chunk.
+// fail remembers err as the source's own failure, not the object's.
 func (c *chunkSource) fail(err error) error {
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, storages.ErrInvalidRange) {
-		return fmt.Errorf("read %q: %w", c.key, io.ErrUnexpectedEOF)
-	}
 	c.err = err
 	return err
 }
 
-func (c *chunkSource) sourceErr() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.err
-}
+func (c *chunkSource) sourceErr() error { return c.err }
 
-func (c *chunkSource) closeBody(body io.Closer) {
-	if err := body.Close(); err != nil {
-		c.logger.Warn("close object range", "key", c.key, "error", err)
-	}
-}
-
-// Close closes the stream without waiting for a read on it, which it ends.
+// Close closes the stream, ending a read blocked on it.
 func (c *chunkSource) Close() error {
-	c.streamMu.Lock()
-	c.closed = true
-	stream := c.stream
-	c.streamMu.Unlock()
-	if stream == nil {
+	if c.stream == nil {
 		return nil
 	}
-	return stream.Close()
+	return c.stream.Close()
 }
 
 // rangeBody is a range response's body, remembering the failure it returned itself.

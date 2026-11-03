@@ -110,11 +110,11 @@ func TestStorage_GetObjectRange_requests(t *testing.T) {
 		want           int
 	}{
 		{name: "a small object is read whole", size: wholeObjectSize / 2, offset: 1000, length: 10, want: 2},
-		{name: "chunks near the header share its request", size: size, offset: 10, length: 2 * chunkSize, want: 3},
+		{name: "chunks at the start", size: size, offset: 10, length: 2 * chunkSize, want: 4},
 		{name: "chunks far from the header", size: size, offset: 2 * wholeObjectSize, length: 2 * chunkSize, want: 4},
-		{name: "the final chunk", size: size, offset: size - 10, length: -1, want: 3},
-		{name: "to the end", size: size, offset: 5, length: -1, want: 3},
-		{name: "a length past any end", size: size, offset: 5, length: math.MaxInt64, want: 3},
+		{name: "the final chunk alone", size: size, offset: size - 10, length: -1, want: 3},
+		{name: "to the end", size: size, offset: 5, length: -1, want: 4},
+		{name: "a length past any end", size: size, offset: 5, length: math.MaxInt64, want: 4},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -126,6 +126,51 @@ func TestStorage_GetObjectRange_requests(t *testing.T) {
 			readRange(t, st, "obj", tt.offset, tt.length)
 
 			assert.Equal(t, tt.want, inner.reads())
+		})
+	}
+}
+
+func TestStorage_GetObjectRange_requestOffsets(t *testing.T) {
+	const size = 4 * wholeObjectSize
+	tests := []struct {
+		name           string
+		offset, length int64
+		// span is whether the range needs chunks before the final one.
+		span bool
+	}{
+		{name: "chunks in the middle", offset: 2 * wholeObjectSize, length: 2 * chunkSize, span: true},
+		{name: "the chunk before the final one", offset: size - chunkSize - 10, length: 5, span: true},
+		{name: "into the final chunk", offset: size - chunkSize - 10, length: 20, span: true},
+		{name: "the final chunk alone", offset: size - 10, length: -1, span: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Arrange
+			inner := &recordingStorage{Storager: inmemory.New("")}
+			st := newTestStorage(t, inner)
+			require.NoError(t, st.PutObject(t.Context(), "obj", bytes.NewReader(newContent(size))))
+			stat, err := inner.Stat("obj")
+			require.NoError(t, err)
+			end := int64(size)
+			if tt.length > 0 {
+				end = tt.offset + tt.length
+			}
+			bodyStart, bodyEnd := st.layout.chunkSpan(tt.offset, end, stat.Size)
+			tailStart := st.layout.finalChunkOffset(stat.Size)
+			want := []rangeRequest{
+				{offset: 0, length: headerReadSize},
+				{offset: tailStart, length: stat.Size - tailStart},
+			}
+			if tt.span {
+				want = append(want, rangeRequest{offset: bodyStart, length: min(bodyEnd, tailStart) - bodyStart})
+			}
+			inner.reset()
+
+			// Act
+			readRange(t, st, "obj", tt.offset, tt.length)
+
+			// Assert
+			assert.Equal(t, want, inner.requests())
 		})
 	}
 }
@@ -355,6 +400,16 @@ func TestStorage_GetObject_StoreFailure(t *testing.T) {
 				return readErr(st.GetObjectRange(t.Context(), "obj", wholeObjectSize, 10))
 			},
 		},
+		// The header and final chunk fit in failAfter; the two-chunk stream does not.
+		{name: "GetObjectRange in the chunk stream", size: large, failAfter: encChunkSize + 1000, err: errStore, read: func(st storages.Storager) error {
+			return readErr(st.GetObjectRange(t.Context(), "obj", wholeObjectSize, 2*chunkSize))
+		}},
+		{
+			name: "a connection dropped in the chunk stream", size: large, failAfter: encChunkSize + 1000, err: io.ErrUnexpectedEOF,
+			read: func(st storages.Storager) error {
+				return readErr(st.GetObjectRange(t.Context(), "obj", wholeObjectSize, 2*chunkSize))
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -532,6 +587,36 @@ func (c *countingStorage) reads() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.n
+}
+
+// recordingStorage records the ranges requested of it.
+type recordingStorage struct {
+	storages.Storager
+	mu   sync.Mutex
+	reqs []rangeRequest
+}
+
+type rangeRequest struct {
+	offset, length int64
+}
+
+func (r *recordingStorage) GetObjectRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+	r.mu.Lock()
+	r.reqs = append(r.reqs, rangeRequest{offset: offset, length: length})
+	r.mu.Unlock()
+	return r.Storager.GetObjectRange(ctx, key, offset, length)
+}
+
+func (r *recordingStorage) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reqs = nil
+}
+
+func (r *recordingStorage) requests() []rangeRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reqs
 }
 
 // encryptedSize is what an object of plain bytes takes in the store.

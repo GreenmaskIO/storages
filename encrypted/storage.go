@@ -15,7 +15,8 @@
 // Package encrypted wraps a Storager so that every object it writes is an age
 // file encrypted to one X25519 identity, and every object it reads is
 // decrypted. Keys, listings and the directory tree pass through unchanged;
-// sizes are reported in plaintext bytes.
+// sizes are reported in plaintext bytes. How a range read is served is
+// explained at the top of range.go.
 package encrypted
 
 import (
@@ -66,6 +67,11 @@ func New(store storages.Storager, identity *age.X25519Identity, opts ...Option) 
 	payloadOffset, err := measurePayloadOffset(recipient)
 	if err != nil {
 		return nil, err
+	}
+	// A range read holds the first headerReadSize bytes and expects the header and
+	// nonce in them; one X25519 stanza makes a header of about 200 bytes.
+	if payloadOffset > headerReadSize {
+		return nil, fmt.Errorf("age header of %d bytes exceeds the %d a range read holds", payloadOffset, headerReadSize)
 	}
 	s := &Storage{
 		store:     store,

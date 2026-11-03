@@ -226,8 +226,8 @@ st, err := encrypted.New(s3Storage, identity)
 - **Range reads stay cheap.** `GetObjectRange` decrypts only the 64 KiB chunks
   the range covers: an object of up to 1 MiB is fetched whole, a larger one as
   its header, its final chunk (which authenticates the size) and the chunks the
-  range needs. With the `Stat` that sizes it, a read costs two requests on a
-  small object and three or four on a large one.
+  range needs, one request each. With the `Stat` that sizes it, a read costs
+  two requests on a small object and four on a large one.
 - **Copies stay server-side.** A ciphertext does not depend on its key, so
   `Copy` and `CopyAll` copy it as is; `CopyAll` reaches a backend's own listed
   copy (`storages.ListedCopier`, which S3 implements) per object.

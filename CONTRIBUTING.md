@@ -90,6 +90,10 @@ Go has no test-only dependency scope, so keep the main module's `go.mod` minimal
 - `testify` is imported from `_test.go` files only.
 - `storagetest` imports only the standard library and `storages`.
 - `testcontainers` lives in `tests/integration`, a separate, unpublished module.
+- Dependabot updates only the main module (`.github/dependabot.yml`).
+  `tests/integration` replaces the parent, so a bump can fail its CI job with
+  `updates to go.mod needed`. Run `GOWORK=off go mod tidy` in `tests/integration`
+  and commit the result to the PR.
 
 These checks must print nothing:
 

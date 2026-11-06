@@ -10,6 +10,17 @@ as the body of the draft GitHub release, so every released version must have a
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-06
+
+### Security
+
+- The `tests/integration` module moves off versions with known vulnerabilities:
+  `github.com/klauspost/compress` to 1.18.7 (GHSA-259r-337f-4rfw),
+  `github.com/moby/go-archive` to 0.3.0 (GHSA-hfg8-hc9c-6c3h) and
+  `github.com/moby/sys/user` to 0.4.1 (GHSA-mjcv-p78q-w5fw). That module is not
+  published and none of these packages are in the library's module graph, so
+  the library's code and dependencies are the same as in 0.4.0.
+
 ## [0.4.0] - 2026-11-03
 
 ### Added

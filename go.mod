@@ -14,7 +14,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.105.2
 	github.com/aws/aws-sdk-go-v2/service/sts v1.44.1
 	github.com/aws/smithy-go v1.27.4
-	github.com/pkg/sftp v1.13.11
+	github.com/pkg/sftp v1.13.12
 	github.com/spf13/afero v1.15.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.55.0

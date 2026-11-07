@@ -1,0 +1,39 @@
+version: 2
+
+updates:
+  # The published library: the only go.mod that reaches consumers.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    exclude-paths:
+      - examples/**
+      - tests/**
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      aws:
+        patterns:
+          - github.com/aws/*
+      azure:
+        patterns:
+          - github.com/Azure/*
+      golang-x:
+        patterns:
+          - golang.org/x/*
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Modules that are never published. exclude-paths covers version updates only;
+  # ignore is what also stops security updates here.
+  - package-ecosystem: gomod
+    directories:
+      - /tests/integration
+      - /examples/s3_with_logger
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "*"

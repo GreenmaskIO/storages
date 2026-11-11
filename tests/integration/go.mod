@@ -19,7 +19,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.9
 	github.com/greenmaskio/storages v0.0.0-00010101000000-000000000000
 	github.com/moby/moby/api v1.54.2
-	github.com/pkg/sftp v1.13.11
+	github.com/pkg/sftp v1.13.12
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/azure v0.43.0

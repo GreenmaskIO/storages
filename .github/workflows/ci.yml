@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Dispatched by dependabot-tidy.yml after it pushes, since that push starts no run.
+  workflow_dispatch:
 
 permissions:
   contents: read

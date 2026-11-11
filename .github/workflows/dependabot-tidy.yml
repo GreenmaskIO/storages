@@ -1,0 +1,52 @@
+name: Dependabot tidy
+
+# Dependabot updates only the root go.mod. tests/integration and
+# examples/s3_with_logger replace the root module with ../.., so their go.mod
+# goes stale and CI fails with "updates to go.mod needed". This job tidies them
+# on the Dependabot branch and re-runs CI, since a push made with GITHUB_TOKEN
+# does not trigger workflows.
+
+on:
+  pull_request:
+    paths:
+      - go.mod
+      - go.sum
+
+permissions:
+  contents: read
+
+jobs:
+  tidy:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Tidy dependent modules
+        env:
+          GOWORK: "off"
+        run: |
+          for dir in tests/integration examples/s3_with_logger; do
+            (cd "$dir" && go mod tidy)
+          done
+      - name: Commit, push and re-run CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if git diff --quiet; then
+            echo "Already tidy."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore(deps): tidy dependent modules"
+          git push origin "HEAD:$HEAD_REF"
+          gh workflow run ci.yml --ref "$HEAD_REF"

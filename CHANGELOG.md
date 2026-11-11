@@ -10,6 +10,8 @@ as the body of the draft GitHub release, so every released version must have a
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
 ### Changed
 
 - **Breaking:** the module requires Go 1.26. The fixed releases of
@@ -19,6 +21,9 @@ as the body of the draft GitHub release, so every released version must have a
   1.15.0. `azblob` stays at 1.8.0: from 1.8.1 its container package imports
   `github.com/apache/arrow-go`, which would roughly double the module graph of
   every consumer.
+- `github.com/pkg/sftp` to 1.13.12. The `ssh` backend's client rejects
+  malformed server replies, and `File.ReadFrom` returns the write error for a
+  short final chunk.
 
 ### Security
 

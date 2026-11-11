@@ -10,6 +10,25 @@ as the body of the draft GitHub release, so every released version must have a
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** the module requires Go 1.26. The fixed releases of
+  `golang.org/x/crypto` and `golang.org/x/net` require it, and Go 1.25 no longer
+  receives security fixes.
+- `github.com/Azure/azure-sdk-for-go/sdk/azcore` to 1.24.0 and `azidentity` to
+  1.15.0. `azblob` stays at 1.8.0: from 1.8.2 its container package imports
+  `github.com/apache/arrow-go`, which would roughly double the module graph of
+  every consumer.
+
+### Security
+
+- `golang.org/x/crypto` to 0.59.0: fixes GO-2026-6354 and GO-2026-6355, denial
+  of service on a deadlocked channel in `x/crypto/ssh`, reachable from the
+  `ssh` backend.
+- `golang.org/x/net` to 0.62.0: fixes GO-2026-6603, GO-2026-6610, GO-2026-6611,
+  GO-2026-6612 and GO-2026-6617 in HTTP/2, reachable through the `azure`
+  backend's HTTP transport.
+
 ## [0.4.1] - 2026-11-06
 
 ### Security

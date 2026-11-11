@@ -34,7 +34,7 @@ Need something else? See [Writing your own backend](#writing-your-own-backend).
 go get github.com/greenmaskio/storages
 ```
 
-Requires Go 1.25+.
+Requires Go 1.26+.
 
 ## Usage
 

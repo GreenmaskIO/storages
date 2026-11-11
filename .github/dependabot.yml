@@ -12,10 +12,10 @@ updates:
     commit-message:
       prefix: chore(deps)
     ignore:
-      # 1.8.2 makes the container package import github.com/apache/arrow-go,
+      # 1.8.1 makes the container package import github.com/apache/arrow-go,
       # which doubles the module graph every consumer inherits.
       - dependency-name: github.com/Azure/azure-sdk-for-go/sdk/storage/azblob
-        versions: [">= 1.8.2"]
+        versions: [">= 1.8.1"]
     groups:
       aws:
         patterns:

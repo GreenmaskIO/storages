@@ -16,7 +16,7 @@ as the body of the draft GitHub release, so every released version must have a
   `golang.org/x/crypto` and `golang.org/x/net` require it, and Go 1.25 no longer
   receives security fixes.
 - `github.com/Azure/azure-sdk-for-go/sdk/azcore` to 1.24.0 and `azidentity` to
-  1.15.0. `azblob` stays at 1.8.0: from 1.8.2 its container package imports
+  1.15.0. `azblob` stays at 1.8.0: from 1.8.1 its container package imports
   `github.com/apache/arrow-go`, which would roughly double the module graph of
   every consumer.
 

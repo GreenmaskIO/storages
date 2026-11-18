@@ -10,15 +10,13 @@ as the body of the draft GitHub release, so every released version must have a
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-11-18
+## [0.5.1] - 2026-11-18
 
 ### Changed
 
-- The `s3` backend's AWS SDK: `github.com/aws/aws-sdk-go-v2` to 1.48.0,
-  `config` to 1.33.18, `credentials` to 1.21.0, `feature/s3/manager` to
-  1.23.24, `service/s3` to 1.114.10, `service/sts` to 1.52.0 and
-  `github.com/aws/smithy-go` to 1.28.9, with their indirect modules. The
-  library's API and behaviour are unchanged.
+- AWS SDK for the `s3` backend: `aws-sdk-go-v2` to 1.48.0, `service/s3` to
+  1.114.10, `feature/s3/manager` to 1.23.24, `config` to 1.33.18,
+  `credentials` to 1.21.0, `service/sts` to 1.52.0, `smithy-go` to 1.28.9.
 
 ## [0.5.0] - 2026-11-11
 
